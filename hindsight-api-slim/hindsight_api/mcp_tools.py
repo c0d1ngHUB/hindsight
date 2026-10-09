@@ -7,9 +7,10 @@ This module provides the core tool logic used by both:
 
 import json
 import logging
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Literal, get_args
+from typing import Annotated, Any, Callable, Literal, get_args
 
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -29,6 +30,13 @@ from hindsight_api.extensions import OperationValidationError
 from hindsight_api.models import RequestContext
 
 _TAG_GROUP_LIST_ADAPTER = TypeAdapter(list[TagGroup])
+
+# Paging bounds for the list tools. They match the HTTP endpoints' Query bounds
+# so a limit rejected over HTTP is rejected over MCP too (#4859).
+_Offset = Annotated[int, Field(ge=0)]
+_Limit = Annotated[int, Field(ge=0)]
+_Limit1000 = Annotated[int, Field(ge=1, le=1000)]
+_OperationsLimit = Annotated[int, Field(ge=1, le=100)]
 
 # All tools available in the system (explicit list — no wildcards).
 # Defined here (shared module) to avoid circular imports with api/mcp.py.
@@ -144,11 +152,17 @@ class MentalModelTriggerInput(BaseModel):
             "Unset means 'all_strict' for a tagged model and 'any' for an untagged one."
         ),
     )
-    tag_groups: list[TagGroup] | None = Field(
+    # Plain JSON objects, not list[TagGroup]: TagGroup nests itself (and/or/not hold
+    # more groups), so its JSON schema is recursive. Some LLM providers reject a
+    # recursive tool schema and fail the whole request, not just this tool (#5013).
+    # validate_tag_groups below still checks the shape, same as recall does.
+    tag_groups: list[dict[str, Any]] | None = Field(
         default=None,
         description=(
-            "Compound boolean tag expressions (nested and/or/not) used during refresh INSTEAD of the model's "
-            "flat tags. When set, the model's own tags are not used for filtering."
+            "Compound boolean tag expressions used during refresh INSTEAD of the model's flat tags. When set, "
+            "the model's own tags are not used for filtering. Each group is a leaf "
+            "{'tags': [...], 'match': 'any'|'all'|'any_strict'|'all_strict'|'exact'} or a compound "
+            "{'and': [groups]}, {'or': [groups]}, {'not': group}, nested to any depth."
         ),
     )
     include_chunks: bool | None = Field(
@@ -162,6 +176,28 @@ class MentalModelTriggerInput(BaseModel):
     recall_chunks_max_tokens: int | None = Field(
         default=None,
         description="Override the token budget for raw chunks from the refresh's internal recall. null = bank/global default.",
+    )
+    budget: Budget | None = Field(
+        default=None,
+        description=(
+            "How many agent steps a refresh may spend, as a multiple of the server's reflect iteration "
+            "limit: 'low' halves it, 'mid' keeps it, 'high' doubles it. null = mid."
+        ),
+    )
+    reflect_search_observations_max_tokens: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Override the token budget for the refresh's search_observations calls. Lowering it drops the "
+            "lowest-ranked observations and shrinks the reflect context. null = the shipped 5000."
+        ),
+    )
+    reflect_search_observations_include_entities: bool | None = Field(
+        default=None,
+        description=(
+            "Override whether search_observations attaches resolved entity names, which can be over half the "
+            "tool payload. null = enabled."
+        ),
     )
     response_schema: dict | None = Field(
         default=None,
@@ -195,6 +231,16 @@ class MentalModelTriggerInput(BaseModel):
         if not croniter.is_valid(value):
             raise ValueError(f"refresh_cron is not a valid cron expression: {value!r}")
         return value
+
+    @field_validator("tag_groups")
+    @classmethod
+    def validate_tag_groups(cls, value: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        if value is None:
+            return None
+        # Round-trip through TagGroup so the engine gets the same canonical dicts the
+        # typed field used to dump (e.g. a 'filters' key comes out as 'and'/'or').
+        groups = _TAG_GROUP_LIST_ADAPTER.validate_python(value)
+        return _TAG_GROUP_LIST_ADAPTER.dump_python(groups, by_alias=True, exclude_unset=True)
 
     @field_validator("fact_types")
     @classmethod
@@ -253,6 +299,11 @@ class MCPToolsConfig:
     # How to resolve bank_id for operations
     bank_id_resolver: Callable[[], str | None]
 
+    # Maps an aliased bank id onto the bank's canonical one, for the same reason the
+    # HTTP route class does (see hindsight_api.engine.bank_aliases). Set by
+    # register_mcp_tools, which has the engine; None leaves every id untouched.
+    bank_alias_resolver: Callable[[str], Awaitable[str]] | None = None
+
     # How to resolve API key for tenant auth (optional)
     api_key_resolver: Callable[[], str | None] | None = None
 
@@ -280,6 +331,125 @@ class MCPToolsConfig:
     extra_headers_resolver: Callable[[], dict[str, str]] | None = None
 
     # Retain behavior
+
+
+def _error_json(message: object, **extra: Any) -> str:
+    """One tool error, serialized as JSON text.
+
+    The bank-id-parameter variants of these tools declare ``-> str`` and return
+    JSON text, so an error has to be JSON too. Every one of them used to build it
+    by interpolation — ``f'{{"error": "{e}"}}'`` — which silently emits invalid
+    JSON the moment the message contains a double quote, a backslash or a
+    newline. PostgreSQL quotes identifiers with double quotes, so an ordinary
+    ``relation "memory_units" does not exist`` was already enough to hand the
+    caller something it could not parse. ``json.dumps`` escapes all three.
+
+    ``extra`` carries the empty collection some tools include alongside the error
+    (``results``/``items``/``banks``/``text``) so a caller can keep reading the
+    response with its normal shape.
+    """
+    return json.dumps({"error": str(message), **extra})
+
+
+class _ToolError(Exception):
+    """A tool-level failure to report to the caller without logging a stack trace.
+
+    Distinct from an unexpected exception: "no such memory" is a normal answer,
+    not a bug, so it must not fill the log with tracebacks.
+    """
+
+
+async def _resolve_bank(config: MCPToolsConfig, bank_id: str | None) -> str | None:
+    """The session's bank, or the explicit one a multi-bank tool was given.
+
+    The **session** bank needs no work here: the transport resolved any alias when
+    the connection's id entered the process (see ``api/mcp.py``), so the contextvar
+    already holds a real bank id. Only an id passed as a tool *argument* has
+    bypassed that edge, so only that one is resolved — which also keeps every
+    session-bank tool call free of a database round trip it does not need.
+    """
+    if bank_id is None:
+        return config.bank_id_resolver()
+    if config.bank_alias_resolver is None:
+        return bank_id
+    return await config.bank_alias_resolver(bank_id)
+
+
+async def _run_tool(
+    config: MCPToolsConfig,
+    *,
+    bank_id: str | None,
+    as_json: bool,
+    action: str,
+    run: Callable[[str], Awaitable[Any]],
+    indent: int | None = 2,
+    error_extra: dict[str, Any] | None = None,
+    value_error: Literal["fault", "rejection", "expected"] = "fault",
+) -> Any:
+    """Resolve the target bank, run one tool's work, and shape its result and errors.
+
+    Every MCP tool is registered twice — once taking an explicit ``bank_id`` and
+    returning JSON text, once resolving the bank from the session and returning a
+    dict — and both copies wrapped their one engine call in the same fifteen
+    lines: resolve the bank, reject a missing one, serialize, and map
+    ``OperationValidationError`` and everything else onto an error payload. That
+    wrapper is what this is; only ``run`` differs per tool, so ``run`` is all a
+    registrar now writes once and both copies share.
+
+    The two shapes are deliberately preserved, not unified: the bank-id variants
+    declare ``-> str`` and callers ``json.loads`` them, so returning a dict there
+    would be a breaking change.
+
+    Args:
+        bank_id: Explicit bank from the caller, or None to use the session bank.
+        as_json: True for the ``-> str`` variants, False for the ``-> dict`` ones.
+        action: Gerund phrase for the error log, e.g. "getting memory".
+        run: Receives the resolved bank id and returns the tool's result. Raise
+            ``_ToolError`` from it for an expected failure.
+        indent: ``json.dumps`` indent for a successful payload; None for compact
+            output, matching what each call site produced before.
+        error_extra: Empty collection some tools include beside the error
+            (``results``/``items``/``banks``/``text``) so a caller can keep
+            reading the response with its normal shape.
+        value_error: How this tool treated ``ValueError``, which was not uniform
+            and is not arbitrary — it is whether a bad value is this tool's fault
+            or the caller's:
+
+            * ``"fault"`` — a bug: logged with a stack trace (the default).
+            * ``"rejection"`` — the caller's input was refused: logged as a
+              warning beside ``OperationValidationError``, which is how the tools
+              that validate arguments themselves reported it.
+            * ``"expected"`` — a normal negative answer: returned with no log at
+              all, as the tools that use it for "not found" did.
+    """
+    extra = error_extra or {}
+
+    def _ok(value: Any) -> Any:
+        return json.dumps(value, indent=indent, default=str) if as_json else value
+
+    def _err(message: object) -> Any:
+        return _error_json(message, **extra) if as_json else {"error": str(message), **extra}
+
+    try:
+        target_bank = await _resolve_bank(config, bank_id)
+        if target_bank is None:
+            return _err("No bank_id configured")
+        return _ok(await run(target_bank))
+    except _ToolError as e:
+        return _err(e)
+    except OperationValidationError as e:
+        logger.warning(f"Operation rejected: {e}")
+        return _err(e)
+    except Exception as e:
+        # ValueError is handled here rather than in its own `except ValueError`
+        # clause because re-raising from a clause propagates out of the whole
+        # `try` — an unexpected ValueError would escape instead of reaching this.
+        if isinstance(e, ValueError) and value_error != "fault":
+            if value_error == "rejection":
+                logger.warning(f"Operation rejected: {e}")
+            return _err(e)
+        logger.error(f"Error {action}: {e}", exc_info=True)
+        return _err(e)
 
 
 def _get_request_context(config: MCPToolsConfig) -> RequestContext:
@@ -441,6 +611,15 @@ def register_mcp_tools(
         memory: MemoryEngine instance
         config: Tool configuration
     """
+    if config.bank_alias_resolver is None:
+        # Wired here because this is where the engine is in scope. The MCP transport
+        # has already set the tenant schema contextvar the lookup is keyed on (see
+        # api/mcp.py), so by the time a tool runs this resolves in the right tenant.
+        async def _resolve_alias(bank_id: str) -> str:
+            return await memory.resolve_bank_alias(bank_id, request_context=_get_request_context(config))
+
+        config.bank_alias_resolver = _resolve_alias
+
     tools_to_register = config.tools or {
         "retain",
         "sync_retain",
@@ -619,7 +798,7 @@ def _apply_bank_tool_filtering(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
 
     async def _get_enabled_tools() -> set[str] | None:
         """Return the enabled tool set for the current bank, or None if unrestricted."""
-        bank_id = config.bank_id_resolver()
+        bank_id = await _resolve_bank(config, None)
         if not bank_id:
             return None
         request_context = _get_request_context(config)
@@ -849,7 +1028,7 @@ def _register_retain(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                 strategy: Optional named retain strategy (e.g., 'exact' for verbatim storage). Strategies are defined in the bank config.
                 update_mode: How to handle existing documents with the same document_id. 'replace' (default) or 'append' (concatenates new content to existing).
             """
-            target_bank = bank_id or config.bank_id_resolver()
+            target_bank = await _resolve_bank(config, bank_id)
             if target_bank is None:
                 return {"status": "error", "message": "No bank_id configured"}
 
@@ -908,7 +1087,7 @@ def _register_retain(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                 strategy: Optional named retain strategy (e.g., 'exact' for verbatim storage). Strategies are defined in the bank config.
                 update_mode: How to handle existing documents with the same document_id. 'replace' (default) or 'append' (concatenates new content to existing).
             """
-            target_bank = config.bank_id_resolver()
+            target_bank = await _resolve_bank(config, None)
             if target_bank is None:
                 return {"status": "error", "message": "No bank_id configured"}
 
@@ -975,7 +1154,7 @@ def _register_sync_retain(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
                 bank_id: Optional bank to store in (defaults to session bank). Use for cross-bank operations.
                 strategy: Optional named retain strategy (e.g., 'exact' for verbatim storage). Strategies are defined in the bank config.
             """
-            target_bank = bank_id or config.bank_id_resolver()
+            target_bank = await _resolve_bank(config, bank_id)
             if target_bank is None:
                 return {"status": "error", "message": "No bank_id configured"}
 
@@ -1035,7 +1214,7 @@ def _register_sync_retain(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
                 document_id: Optional document ID to associate this memory with
                 strategy: Optional named retain strategy (e.g., 'exact' for verbatim storage). Strategies are defined in the bank config.
             """
-            target_bank = config.bank_id_resolver()
+            target_bank = await _resolve_bank(config, None)
             if target_bank is None:
                 return {"status": "error", "message": "No bank_id configured"}
 
@@ -1094,7 +1273,9 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
             """
             Args:
                 query: Natural language search query (e.g., "user's food preferences", "what projects is user working on")
-                max_tokens: Maximum tokens to return in results (default: 4096)
+                max_tokens: Token budget for the facts' text (default: 4096). Only each result's
+                    'text' counts; the id, tags, scores and dates sent with every result do not,
+                    so the response is several times larger than this.
                 budget: Search budget - 'low', 'mid', or 'high' (default: 'high'). Higher budgets search more thoroughly.
                 types: Fact types to include (e.g., ['world', 'experience']). Default: all types.
                 prefer_observations: When recalling raw facts together with 'observation', drop any raw fact
@@ -1127,7 +1308,7 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                 bank_id: Optional bank to search in (defaults to session bank). Use for cross-bank operations.
             """
             try:
-                target_bank = bank_id or config.bank_id_resolver()
+                target_bank = await _resolve_bank(config, bank_id)
                 if target_bank is None:
                     return "Error: No bank_id configured"
 
@@ -1163,15 +1344,18 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
 
                 recall_result = await memory.recall_async(**recall_kwargs)
 
-                return recall_result.model_dump_json(indent=2)
+                # Compact, as FastMCP already sends the session-bank copy's dict. This
+                # used indent=2, which was about a fifth of a recall response that
+                # lands whole in the calling agent's context.
+                return recall_result.model_dump_json()
             except OperationValidationError as e:
                 logger.warning(f"Recall rejected: {e}")
                 return json.dumps({"error": str(e), "results": []})
             except ValueError as e:
-                return f'{{"error": "{e}", "results": []}}'
+                return _error_json(e, results=[])
             except Exception as e:
                 logger.error(f"Error searching: {e}", exc_info=True)
-                return f'{{"error": "{e}", "results": []}}'
+                return _error_json(e, results=[])
 
     else:
 
@@ -1192,7 +1376,9 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
             """
             Args:
                 query: Natural language search query (e.g., "user's food preferences", "what projects is user working on")
-                max_tokens: Maximum tokens to return in results (default: 4096)
+                max_tokens: Token budget for the facts' text (default: 4096). Only each result's
+                    'text' counts; the id, tags, scores and dates sent with every result do not,
+                    so the response is several times larger than this.
                 budget: Search budget - 'low', 'mid', or 'high' (default: 'high'). Higher budgets search more thoroughly.
                 types: Fact types to include (e.g., ['world', 'experience']). Default: all types.
                 prefer_observations: When recalling raw facts together with 'observation', drop any raw fact
@@ -1224,7 +1410,7 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
                     it, so do not use it to restrict results to a period.
             """
             try:
-                target_bank = config.bank_id_resolver()
+                target_bank = await _resolve_bank(config, None)
                 if target_bank is None:
                     return {"error": "No bank_id configured", "results": []}
 
@@ -1323,7 +1509,7 @@ def _register_reflect(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig
                 bank_id: Optional bank to reflect in (defaults to session bank). Use for cross-bank operations.
             """
             try:
-                target_bank = bank_id or config.bank_id_resolver()
+                target_bank = await _resolve_bank(config, bank_id)
                 if target_bank is None:
                     return "Error: No bank_id configured"
 
@@ -1367,10 +1553,7 @@ def _register_reflect(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig
                 return json.dumps({"error": str(e)})
             except Exception as e:
                 logger.error(f"Error reflecting: {e}", exc_info=True)
-                # Built with json.dumps, not an f-string: error text carries provider
-                # messages with quotes and newlines in them, which hand-rolled JSON
-                # turns into a payload the client cannot parse.
-                return json.dumps({"error": str(e), "text": ""})
+                return _error_json(e, text="")
 
     else:
 
@@ -1419,7 +1602,7 @@ def _register_reflect(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig
                 include_trace: Include the reflection's internal trace fields (tool_trace/llm_trace and directives_applied). Defaults to false because the trace can be tens of KB and overflow MCP client context; enable only for debugging.
             """
             try:
-                target_bank = config.bank_id_resolver()
+                target_bank = await _resolve_bank(config, None)
                 if target_bank is None:
                     return {"error": "No bank_id configured", "text": ""}
 
@@ -1470,7 +1653,7 @@ def _register_list_banks(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCon
     """Register the list_banks tool."""
 
     @mcp.tool(annotations=_tool_annotations("list_banks"))
-    async def list_banks(query: str | None = None, limit: int = 100, offset: int = 0) -> str:
+    async def list_banks(query: str | None = None, limit: _Limit = 100, offset: _Offset = 0) -> str:
         """
         List available memory banks, most recently written first.
 
@@ -1499,7 +1682,7 @@ def _register_list_banks(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCon
             return json.dumps({"error": str(e), "banks": []})
         except Exception as e:
             logger.error(f"Error listing banks: {e}", exc_info=True)
-            return f'{{"error": "{e}", "banks": []}}'
+            return _error_json(e, banks=[])
 
 
 def _register_create_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
@@ -1530,7 +1713,7 @@ def _register_create_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
             else:
                 # The public profile API owns bank creation and its lifecycle
                 # validation when no profile fields need updating.
-                profile = await memory.get_bank_profile(bank_id, request_context=request_context)
+                profile = await memory.ensure_bank_profile(bank_id, request_context=request_context)
 
             # Serialize disposition if it's a Pydantic model
             if "disposition" in profile and hasattr(profile["disposition"], "model_dump"):
@@ -1541,7 +1724,7 @@ def _register_create_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
             return json.dumps({"error": str(e)})
         except Exception as e:
             logger.error(f"Error creating bank: {e}", exc_info=True)
-            return f'{{"error": "{e}"}}'
+            return _error_json(e)
 
 
 def _validate_mental_model_inputs(
@@ -1571,62 +1754,71 @@ def _validate_mental_model_inputs(
 def _register_list_mental_models(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the list_mental_models tool."""
 
+    async def _run(target_bank: str, tags: list[str] | None, limit: int, offset: int) -> Any:
+        # Listing returns metadata only (id, name, tags, staleness) — never the
+        # synthesized content. Returning every model's content in a list wastes
+        # an agent's context and let one call pull a whole bank's synthesized
+        # knowledge; agents read a specific model's content with get_mental_model
+        # instead. Staleness is included so an agent can tell which models are
+        # out of date without reading them.
+        page = await memory.list_mental_models(
+            bank_id=target_bank,
+            tags=tags,
+            detail="metadata",
+            limit=limit,
+            offset=offset,
+            with_staleness=True,
+            request_context=_get_request_context(config),
+        )
+        return {"items": page.items, "total": page.total}
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("list_mental_models"))
         async def list_mental_models(
             tags: list[str] | None = None,
-            detail: str = "full",
-            limit: int = 100,
-            offset: int = 0,
+            limit: _Limit1000 = 100,
+            offset: _Offset = 0,
             bank_id: str | None = None,
         ) -> str:
             """
             List mental models (pinned reflections) for a memory bank.
 
+            Returns metadata only (id, name, tags, staleness). To read a model's
+            synthesized content, call get_mental_model with the id from this list.
+
             Mental models are living documents that stay current by periodically re-running
             a source query through reflect. Use them to maintain up-to-date summaries,
             preferences, or synthesized knowledge.
 
             Args:
                 tags: Optional tags to filter by (returns models matching any tag)
-                detail: Detail level - 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response). Default: 'full'
-                limit: Maximum number of results (default: 100)
+                limit: Maximum number of results, 1-1000 (default: 100)
                 offset: Pagination offset (default: 0). Page until the returned items add up to 'total'.
                 bank_id: Optional bank to list from (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured", "items": []}'
-
-                page = await memory.list_mental_models(
-                    bank_id=target_bank,
-                    tags=tags,
-                    detail=detail,
-                    limit=limit,
-                    offset=offset,
-                    request_context=_get_request_context(config),
-                )
-                return json.dumps({"items": page.items, "total": page.total}, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error listing mental models: {e}", exc_info=True)
-                return f'{{"error": "{e}", "items": []}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="listing mental models",
+                run=lambda target_bank: _run(target_bank, tags, limit, offset),
+                error_extra={"items": []},
+            )
 
     else:
 
         @mcp.tool(annotations=_tool_annotations("list_mental_models"))
         async def list_mental_models(
             tags: list[str] | None = None,
-            detail: str = "full",
-            limit: int = 100,
-            offset: int = 0,
+            limit: _Limit1000 = 100,
+            offset: _Offset = 0,
         ) -> dict:
             """
             List mental models (pinned reflections) for this memory bank.
+
+            Returns metadata only (id, name, tags, staleness). To read a model's
+            synthesized content, call get_mental_model with the id from this list.
 
             Mental models are living documents that stay current by periodically re-running
             a source query through reflect. Use them to maintain up-to-date summaries,
@@ -1634,35 +1826,33 @@ def _register_list_mental_models(mcp: FastMCP, memory: MemoryEngine, config: MCP
 
             Args:
                 tags: Optional tags to filter by (returns models matching any tag)
-                detail: Detail level - 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response). Default: 'full'
-                limit: Maximum number of results (default: 100)
+                limit: Maximum number of results, 1-1000 (default: 100)
                 offset: Pagination offset (default: 0). Page until the returned items add up to 'total'.
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured", "items": []}
-
-                page = await memory.list_mental_models(
-                    bank_id=target_bank,
-                    tags=tags,
-                    detail=detail,
-                    limit=limit,
-                    offset=offset,
-                    request_context=_get_request_context(config),
-                )
-                return {"items": page.items, "total": page.total}
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error listing mental models: {e}", exc_info=True)
-                return {"error": str(e), "items": []}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="listing mental models",
+                run=lambda target_bank: _run(target_bank, tags, limit, offset),
+                error_extra={"items": []},
+            )
 
 
 def _register_get_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the get_mental_model tool."""
 
+    async def _run(target_bank: str, mental_model_id: str, detail: str) -> Any:
+        model = await memory.get_mental_model(
+            bank_id=target_bank,
+            mental_model_id=mental_model_id,
+            detail=detail,
+            request_context=_get_request_context(config),
+        )
+        if model is None:
+            raise _ToolError(f"Mental model '{mental_model_id}' not found in bank '{target_bank}'")
+        return model
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("get_mental_model"))
@@ -1682,26 +1872,13 @@ def _register_get_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
                 detail: Detail level - 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response). Default: 'full'
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                model = await memory.get_mental_model(
-                    bank_id=target_bank,
-                    mental_model_id=mental_model_id,
-                    detail=detail,
-                    request_context=_get_request_context(config),
-                )
-                if model is None:
-                    return json.dumps({"error": f"Mental model '{mental_model_id}' not found in bank '{target_bank}'"})
-                return json.dumps(model, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error getting mental model: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="getting mental model",
+                run=lambda target_bank: _run(target_bank, mental_model_id, detail),
+            )
 
     else:
 
@@ -1720,31 +1897,69 @@ def _register_get_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
                 mental_model_id: The ID of the mental model to retrieve
                 detail: Detail level - 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response). Default: 'full'
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                model = await memory.get_mental_model(
-                    bank_id=target_bank,
-                    mental_model_id=mental_model_id,
-                    detail=detail,
-                    request_context=_get_request_context(config),
-                )
-                if model is None:
-                    return {"error": f"Mental model '{mental_model_id}' not found in bank '{target_bank}'"}
-                return model
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error getting mental model: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="getting mental model",
+                run=lambda target_bank: _run(target_bank, mental_model_id, detail),
+            )
 
 
 def _register_create_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the create_mental_model tool."""
 
+    async def _run(
+        target_bank: str,
+        name: str,
+        source_query: str,
+        mental_model_id: str | None,
+        tags: list[str] | None,
+        trigger: MentalModelTriggerInput | None,
+        tags_match: str | None,
+        max_tokens: int,
+        trigger_refresh_after_consolidation: bool | None,
+    ) -> Any:
+        validation_error = _validate_mental_model_inputs(
+            name=name, source_query=source_query, max_tokens=max_tokens, tags_match=tags_match
+        )
+        if validation_error:
+            raise _ToolError(validation_error)
+
+        request_context = _get_request_context(config)
+        trigger_patch = _mental_model_trigger_patch(
+            trigger,
+            tags_match=tags_match,
+            refresh_after_consolidation=trigger_refresh_after_consolidation,
+        )
+        if trigger_patch is None and trigger is None:
+            trigger_patch = {"refresh_after_consolidation": False}
+
+        model = await memory.create_mental_model(
+            bank_id=target_bank,
+            name=name,
+            source_query=source_query,
+            content="",
+            mental_model_id=mental_model_id,
+            tags=tags,
+            max_tokens=max_tokens,
+            trigger=trigger_patch,
+            request_context=request_context,
+        )
+
+        result = await memory.submit_async_refresh_mental_model(
+            bank_id=target_bank,
+            mental_model_id=model["id"],
+            request_context=request_context,
+        )
+
+        return {
+            "mental_model_id": model["id"],
+            "operation_id": result["operation_id"],
+            "status": "created",
+            "message": f"Mental model '{name}' created. Content is being generated asynchronously.",
+        }
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("create_mental_model"))
@@ -1792,62 +2007,25 @@ def _register_create_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MC
                 trigger_refresh_after_consolidation: If True, automatically refresh this model after memory consolidation. Default: False
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                validation_error = _validate_mental_model_inputs(
-                    name=name, source_query=source_query, max_tokens=max_tokens, tags_match=tags_match
-                )
-                if validation_error:
-                    return json.dumps({"error": validation_error})
-
-                request_context = _get_request_context(config)
-                trigger_patch = _mental_model_trigger_patch(
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="creating mental model",
+                run=lambda target_bank: _run(
+                    target_bank,
+                    name,
+                    source_query,
+                    mental_model_id,
+                    tags,
                     trigger,
-                    tags_match=tags_match,
-                    refresh_after_consolidation=trigger_refresh_after_consolidation,
-                )
-                if trigger_patch is None and trigger is None:
-                    trigger_patch = {"refresh_after_consolidation": False}
-
-                # Create with placeholder content
-                model = await memory.create_mental_model(
-                    bank_id=target_bank,
-                    name=name,
-                    source_query=source_query,
-                    content="Generating content...",
-                    mental_model_id=mental_model_id,
-                    tags=tags,
-                    max_tokens=max_tokens,
-                    trigger=trigger_patch,
-                    request_context=request_context,
-                )
-
-                # Schedule async refresh to generate actual content
-                result = await memory.submit_async_refresh_mental_model(
-                    bank_id=target_bank,
-                    mental_model_id=model["id"],
-                    request_context=request_context,
-                )
-
-                return json.dumps(
-                    {
-                        "mental_model_id": model["id"],
-                        "operation_id": result["operation_id"],
-                        "status": "created",
-                        "message": f"Mental model '{name}' created. Content is being generated asynchronously.",
-                    }
-                )
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except ValueError as e:
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error creating mental model: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+                    tags_match,
+                    max_tokens,
+                    trigger_refresh_after_consolidation,
+                ),
+                indent=None,
+                value_error="expected",
+            )
 
     else:
 
@@ -1894,63 +2072,70 @@ def _register_create_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MC
                 max_tokens: Maximum tokens for generated content (256-8192, default: 2048)
                 trigger_refresh_after_consolidation: If True, automatically refresh this model after memory consolidation. Default: False
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                validation_error = _validate_mental_model_inputs(
-                    name=name, source_query=source_query, max_tokens=max_tokens, tags_match=tags_match
-                )
-                if validation_error:
-                    return {"error": validation_error}
-
-                request_context = _get_request_context(config)
-                trigger_patch = _mental_model_trigger_patch(
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="creating mental model",
+                run=lambda target_bank: _run(
+                    target_bank,
+                    name,
+                    source_query,
+                    mental_model_id,
+                    tags,
                     trigger,
-                    tags_match=tags_match,
-                    refresh_after_consolidation=trigger_refresh_after_consolidation,
-                )
-                if trigger_patch is None and trigger is None:
-                    trigger_patch = {"refresh_after_consolidation": False}
-
-                model = await memory.create_mental_model(
-                    bank_id=target_bank,
-                    name=name,
-                    source_query=source_query,
-                    content="Generating content...",
-                    mental_model_id=mental_model_id,
-                    tags=tags,
-                    max_tokens=max_tokens,
-                    trigger=trigger_patch,
-                    request_context=request_context,
-                )
-
-                result = await memory.submit_async_refresh_mental_model(
-                    bank_id=target_bank,
-                    mental_model_id=model["id"],
-                    request_context=request_context,
-                )
-
-                return {
-                    "mental_model_id": model["id"],
-                    "operation_id": result["operation_id"],
-                    "status": "created",
-                    "message": f"Mental model '{name}' created. Content is being generated asynchronously.",
-                }
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except ValueError as e:
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error creating mental model: {e}", exc_info=True)
-                return {"error": str(e)}
+                    tags_match,
+                    max_tokens,
+                    trigger_refresh_after_consolidation,
+                ),
+                indent=None,
+                value_error="expected",
+            )
 
 
 def _register_update_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the update_mental_model tool."""
 
+    async def _run(
+        target_bank: str,
+        mental_model_id: str,
+        name: str | None,
+        source_query: str | None,
+        max_tokens: int | None,
+        tags: list[str] | None,
+        trigger: MentalModelTriggerInput | None,
+        tags_match: str | None,
+        trigger_refresh_after_consolidation: bool | None,
+    ) -> Any:
+        validation_error = _validate_mental_model_inputs(
+            name=name, source_query=source_query, max_tokens=max_tokens, tags_match=tags_match
+        )
+        if validation_error:
+            raise _ToolError(validation_error)
+
+        trigger_patch = _mental_model_trigger_patch(
+            trigger,
+            tags_match=tags_match,
+            refresh_after_consolidation=trigger_refresh_after_consolidation,
+        )
+
+        update_kwargs: dict[str, Any] = {
+            "bank_id": target_bank,
+            "mental_model_id": mental_model_id,
+            "name": name,
+            "source_query": source_query,
+            "max_tokens": max_tokens,
+            "tags": tags,
+            "request_context": _get_request_context(config),
+        }
+        if trigger_patch is not None:
+            update_kwargs["trigger"] = trigger_patch
+
+        model = await memory.update_mental_model(**update_kwargs)
+        if model is None:
+            raise _ToolError(f"Mental model '{mental_model_id}' not found in bank '{target_bank}'")
+        return model
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("update_mental_model"))
@@ -1986,45 +2171,23 @@ def _register_update_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MC
                 trigger_refresh_after_consolidation: If set, update whether this model auto-refreshes after consolidation
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                validation_error = _validate_mental_model_inputs(
-                    name=name, source_query=source_query, max_tokens=max_tokens, tags_match=tags_match
-                )
-                if validation_error:
-                    return json.dumps({"error": validation_error})
-
-                trigger_patch = _mental_model_trigger_patch(
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="updating mental model",
+                run=lambda target_bank: _run(
+                    target_bank,
+                    mental_model_id,
+                    name,
+                    source_query,
+                    max_tokens,
+                    tags,
                     trigger,
-                    tags_match=tags_match,
-                    refresh_after_consolidation=trigger_refresh_after_consolidation,
-                )
-
-                update_kwargs: dict[str, Any] = {
-                    "bank_id": target_bank,
-                    "mental_model_id": mental_model_id,
-                    "name": name,
-                    "source_query": source_query,
-                    "max_tokens": max_tokens,
-                    "tags": tags,
-                    "request_context": _get_request_context(config),
-                }
-                if trigger_patch is not None:
-                    update_kwargs["trigger"] = trigger_patch
-
-                model = await memory.update_mental_model(**update_kwargs)
-                if model is None:
-                    return json.dumps({"error": f"Mental model '{mental_model_id}' not found in bank '{target_bank}'"})
-                return json.dumps(model, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error updating mental model: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+                    tags_match,
+                    trigger_refresh_after_consolidation,
+                ),
+            )
 
     else:
 
@@ -2059,50 +2222,38 @@ def _register_update_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MC
                 tags_match: Legacy shorthand for trigger.tags_match
                 trigger_refresh_after_consolidation: If set, update whether this model auto-refreshes after consolidation
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                validation_error = _validate_mental_model_inputs(
-                    name=name, source_query=source_query, max_tokens=max_tokens, tags_match=tags_match
-                )
-                if validation_error:
-                    return {"error": validation_error}
-
-                trigger_patch = _mental_model_trigger_patch(
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="updating mental model",
+                run=lambda target_bank: _run(
+                    target_bank,
+                    mental_model_id,
+                    name,
+                    source_query,
+                    max_tokens,
+                    tags,
                     trigger,
-                    tags_match=tags_match,
-                    refresh_after_consolidation=trigger_refresh_after_consolidation,
-                )
-
-                update_kwargs: dict[str, Any] = {
-                    "bank_id": target_bank,
-                    "mental_model_id": mental_model_id,
-                    "name": name,
-                    "source_query": source_query,
-                    "max_tokens": max_tokens,
-                    "tags": tags,
-                    "request_context": _get_request_context(config),
-                }
-                if trigger_patch is not None:
-                    update_kwargs["trigger"] = trigger_patch
-
-                model = await memory.update_mental_model(**update_kwargs)
-                if model is None:
-                    return {"error": f"Mental model '{mental_model_id}' not found in bank '{target_bank}'"}
-                return model
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error updating mental model: {e}", exc_info=True)
-                return {"error": str(e)}
+                    tags_match,
+                    trigger_refresh_after_consolidation,
+                ),
+            )
 
 
 def _register_delete_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the delete_mental_model tool."""
 
+    async def _run(target_bank: str, mental_model_id: str) -> Any:
+        deleted = await memory.delete_mental_model(
+            bank_id=target_bank,
+            mental_model_id=mental_model_id,
+            request_context=_get_request_context(config),
+        )
+        if not deleted:
+            raise _ToolError(f"Mental model '{mental_model_id}' not found in bank '{target_bank}'")
+        return {"status": "deleted", "mental_model_id": mental_model_id}
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("delete_mental_model"))
@@ -2119,25 +2270,14 @@ def _register_delete_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MC
                 mental_model_id: The ID of the mental model to delete
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                deleted = await memory.delete_mental_model(
-                    bank_id=target_bank,
-                    mental_model_id=mental_model_id,
-                    request_context=_get_request_context(config),
-                )
-                if not deleted:
-                    return json.dumps({"error": f"Mental model '{mental_model_id}' not found in bank '{target_bank}'"})
-                return json.dumps({"status": "deleted", "mental_model_id": mental_model_id})
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error deleting mental model: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="deleting mental model",
+                run=lambda target_bank: _run(target_bank, mental_model_id),
+                indent=None,
+            )
 
     else:
 
@@ -2153,30 +2293,31 @@ def _register_delete_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MC
             Args:
                 mental_model_id: The ID of the mental model to delete
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                deleted = await memory.delete_mental_model(
-                    bank_id=target_bank,
-                    mental_model_id=mental_model_id,
-                    request_context=_get_request_context(config),
-                )
-                if not deleted:
-                    return {"error": f"Mental model '{mental_model_id}' not found in bank '{target_bank}'"}
-                return {"status": "deleted", "mental_model_id": mental_model_id}
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error deleting mental model: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="deleting mental model",
+                run=lambda target_bank: _run(target_bank, mental_model_id),
+                indent=None,
+            )
 
 
 def _register_refresh_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the refresh_mental_model tool."""
 
+    async def _run(target_bank: str, mental_model_id: str) -> Any:
+        result = await memory.submit_async_refresh_mental_model(
+            bank_id=target_bank,
+            mental_model_id=mental_model_id,
+            request_context=_get_request_context(config),
+        )
+        return {
+            "operation_id": result["operation_id"],
+            "status": "queued",
+            "message": f"Refresh queued for mental model '{mental_model_id}'.",
+        }
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("refresh_mental_model"))
@@ -2195,31 +2336,15 @@ def _register_refresh_mental_model(mcp: FastMCP, memory: MemoryEngine, config: M
                 mental_model_id: The ID of the mental model to refresh
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await memory.submit_async_refresh_mental_model(
-                    bank_id=target_bank,
-                    mental_model_id=mental_model_id,
-                    request_context=_get_request_context(config),
-                )
-                return json.dumps(
-                    {
-                        "operation_id": result["operation_id"],
-                        "status": "queued",
-                        "message": f"Refresh queued for mental model '{mental_model_id}'.",
-                    }
-                )
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except ValueError as e:
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error refreshing mental model: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="refreshing mental model",
+                run=lambda target_bank: _run(target_bank, mental_model_id),
+                indent=None,
+                value_error="expected",
+            )
 
     else:
 
@@ -2237,34 +2362,34 @@ def _register_refresh_mental_model(mcp: FastMCP, memory: MemoryEngine, config: M
             Args:
                 mental_model_id: The ID of the mental model to refresh
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                result = await memory.submit_async_refresh_mental_model(
-                    bank_id=target_bank,
-                    mental_model_id=mental_model_id,
-                    request_context=_get_request_context(config),
-                )
-                return {
-                    "operation_id": result["operation_id"],
-                    "status": "queued",
-                    "message": f"Refresh queued for mental model '{mental_model_id}'.",
-                }
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except ValueError as e:
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error refreshing mental model: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="refreshing mental model",
+                run=lambda target_bank: _run(target_bank, mental_model_id),
+                indent=None,
+                value_error="expected",
+            )
 
 
 def _register_clear_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the clear_mental_model tool."""
 
+    async def _run(target_bank: str, mental_model_id: str) -> Any:
+        result = await memory.clear_mental_model(
+            bank_id=target_bank,
+            mental_model_id=mental_model_id,
+            request_context=_get_request_context(config),
+        )
+        if result is None:
+            raise _ToolError(f"Mental model '{mental_model_id}' not found")
+        return {
+            "mental_model_id": result["id"],
+            "status": "cleared",
+            "message": f"Mental model '{mental_model_id}' content cleared. Call refresh_mental_model to rebuild.",
+        }
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("clear_mental_model"))
@@ -2283,33 +2408,15 @@ def _register_clear_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MCP
                 mental_model_id: The ID of the mental model to clear
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await memory.clear_mental_model(
-                    bank_id=target_bank,
-                    mental_model_id=mental_model_id,
-                    request_context=_get_request_context(config),
-                )
-                if result is None:
-                    return json.dumps({"error": f"Mental model '{mental_model_id}' not found"})
-                return json.dumps(
-                    {
-                        "mental_model_id": result["id"],
-                        "status": "cleared",
-                        "message": f"Mental model '{mental_model_id}' content cleared. Call refresh_mental_model to rebuild.",
-                    }
-                )
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except ValueError as e:
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error clearing mental model: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="clearing mental model",
+                run=lambda target_bank: _run(target_bank, mental_model_id),
+                indent=None,
+                value_error="expected",
+            )
 
     else:
 
@@ -2327,31 +2434,15 @@ def _register_clear_mental_model(mcp: FastMCP, memory: MemoryEngine, config: MCP
             Args:
                 mental_model_id: The ID of the mental model to clear
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                result = await memory.clear_mental_model(
-                    bank_id=target_bank,
-                    mental_model_id=mental_model_id,
-                    request_context=_get_request_context(config),
-                )
-                if result is None:
-                    return {"error": f"Mental model '{mental_model_id}' not found"}
-                return {
-                    "mental_model_id": result["id"],
-                    "status": "cleared",
-                    "message": f"Mental model '{mental_model_id}' content cleared. Call refresh_mental_model to rebuild.",
-                }
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except ValueError as e:
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error clearing mental model: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="clearing mental model",
+                run=lambda target_bank: _run(target_bank, mental_model_id),
+                indent=None,
+                value_error="expected",
+            )
 
 
 # =========================================================================
@@ -2455,7 +2546,7 @@ async def _do_get_knowledge_page(
         "description": node.get("source_query"),
         "tags": page.display_tags,
         "timestamp": node.get("last_refreshed_at") or node.get("created_at"),
-        "markdown": page_markdown.render_document(node),
+        "markdown": page_markdown.render_document(node, notice_when_empty=True),
     }
 
 
@@ -2487,7 +2578,7 @@ async def _do_create_knowledge_page(
         bank_id=target_bank,
         name=name,
         source_query=source_query,
-        content="Generating content...",
+        content="",
         parent_id=parent_id,
         tags=tags or None,
         max_tokens=max_tokens,
@@ -2534,6 +2625,9 @@ async def _do_update_knowledge_node(
     # page on a cron schedule does not reset how or from what it rebuilds.
     trigger_patch = _mental_model_trigger_patch(trigger, refresh_after_consolidation=refresh_after_consolidation)
     page_update = source_query is not None or tags is not None or max_tokens is not None or trigger_patch is not None
+    # The engine raises on a no-op patch too (it must: a no-op authorizes nothing,
+    # so falling through would read the node for an unvalidated caller). Kept here
+    # so an agent gets a tool error it can act on rather than an exception.
     if name is None and parent_id is None and not page_update:
         return {
             "error": "Provide name, parent_id, source_query, tags, max_tokens, "
@@ -2578,6 +2672,9 @@ async def _do_delete_knowledge_node(
 def _register_get_knowledge_base_tree(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the get_knowledge_base_tree tool."""
 
+    async def _run(target_bank: str) -> Any:
+        return await _do_get_knowledge_base_tree(memory, target_bank, _get_request_context(config))
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("get_knowledge_base_tree"))
@@ -2599,19 +2696,13 @@ def _register_get_knowledge_base_tree(mcp: FastMCP, memory: MemoryEngine, config
             Args:
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                tree = await _do_get_knowledge_base_tree(memory, target_bank, _get_request_context(config))
-                return json.dumps(tree, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error getting knowledge base tree: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="getting knowledge base tree",
+                run=lambda target_bank: _run(target_bank),
+            )
 
     else:
 
@@ -2629,23 +2720,23 @@ def _register_get_knowledge_base_tree(mcp: FastMCP, memory: MemoryEngine, config
             true means something was written since its last refresh, so it MAY be
             out of date.
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                return await _do_get_knowledge_base_tree(memory, target_bank, _get_request_context(config))
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error getting knowledge base tree: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="getting knowledge base tree",
+                run=lambda target_bank: _run(target_bank),
+            )
 
 
 def _register_search_knowledge_base(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the search_knowledge_base tool."""
 
+    async def _run(target_bank: str, query: str, limit: int) -> Any:
+        return await _do_search_knowledge_base(
+            memory, target_bank, _get_request_context(config), query=query, limit=limit
+        )
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("search_knowledge_base"))
@@ -2666,21 +2757,13 @@ def _register_search_knowledge_base(mcp: FastMCP, memory: MemoryEngine, config: 
                 limit: Maximum pages to return (1-50, default: 10)
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                results = await _do_search_knowledge_base(
-                    memory, target_bank, _get_request_context(config), query=query, limit=limit
-                )
-                return json.dumps(results, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error searching knowledge base: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="searching knowledge base",
+                run=lambda target_bank: _run(target_bank, query, limit),
+            )
 
     else:
 
@@ -2700,25 +2783,21 @@ def _register_search_knowledge_base(mcp: FastMCP, memory: MemoryEngine, config: 
                 query: What to search for
                 limit: Maximum pages to return (1-50, default: 10)
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                return await _do_search_knowledge_base(
-                    memory, target_bank, _get_request_context(config), query=query, limit=limit
-                )
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error searching knowledge base: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="searching knowledge base",
+                run=lambda target_bank: _run(target_bank, query, limit),
+            )
 
 
 def _register_get_knowledge_page(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the get_knowledge_page tool."""
 
+    async def _run(target_bank: str, page_id: str) -> Any:
+        return await _do_get_knowledge_page(memory, target_bank, _get_request_context(config), page_id=page_id)
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("get_knowledge_page"))
@@ -2737,19 +2816,13 @@ def _register_get_knowledge_page(mcp: FastMCP, memory: MemoryEngine, config: MCP
                 page_id: The ID of the page to read (a `kp-...` node id)
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                page = await _do_get_knowledge_page(memory, target_bank, _get_request_context(config), page_id=page_id)
-                return json.dumps(page, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error getting knowledge page: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="getting knowledge page",
+                run=lambda target_bank: _run(target_bank, page_id),
+            )
 
     else:
 
@@ -2767,23 +2840,23 @@ def _register_get_knowledge_page(mcp: FastMCP, memory: MemoryEngine, config: MCP
             Args:
                 page_id: The ID of the page to read (a `kp-...` node id)
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                return await _do_get_knowledge_page(memory, target_bank, _get_request_context(config), page_id=page_id)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error getting knowledge page: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="getting knowledge page",
+                run=lambda target_bank: _run(target_bank, page_id),
+            )
 
 
 def _register_create_knowledge_folder(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the create_knowledge_folder tool."""
 
+    async def _run(target_bank: str, name: str, parent_id: str | None) -> Any:
+        return await _do_create_knowledge_folder(
+            memory, target_bank, _get_request_context(config), name=name, parent_id=parent_id
+        )
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("create_knowledge_folder"))
@@ -2802,23 +2875,14 @@ def _register_create_knowledge_folder(mcp: FastMCP, memory: MemoryEngine, config
                 parent_id: Optional parent folder id (a `kf-...` node id). Omit to create at the top level.
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                node = await _do_create_knowledge_folder(
-                    memory, target_bank, _get_request_context(config), name=name, parent_id=parent_id
-                )
-                return json.dumps(node, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except ValueError as e:
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error creating knowledge folder: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="creating knowledge folder",
+                run=lambda target_bank: _run(target_bank, name, parent_id),
+                value_error="expected",
+            )
 
     else:
 
@@ -2836,27 +2900,42 @@ def _register_create_knowledge_folder(mcp: FastMCP, memory: MemoryEngine, config
                 name: Folder name
                 parent_id: Optional parent folder id (a `kf-...` node id). Omit to create at the top level.
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                return await _do_create_knowledge_folder(
-                    memory, target_bank, _get_request_context(config), name=name, parent_id=parent_id
-                )
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except ValueError as e:
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error creating knowledge folder: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="creating knowledge folder",
+                run=lambda target_bank: _run(target_bank, name, parent_id),
+                value_error="expected",
+            )
 
 
 def _register_create_knowledge_page(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the create_knowledge_page tool."""
 
+    async def _run(
+        target_bank: str,
+        name: str,
+        source_query: str,
+        parent_id: str | None,
+        tags: list[str] | None,
+        max_tokens: int | None,
+        trigger: MentalModelTriggerInput | None,
+        refresh_after_consolidation: bool | None,
+    ) -> Any:
+        return await _do_create_knowledge_page(
+            memory,
+            target_bank,
+            _get_request_context(config),
+            name=name,
+            source_query=source_query,
+            parent_id=parent_id,
+            tags=tags,
+            max_tokens=max_tokens,
+            trigger=trigger,
+            refresh_after_consolidation=refresh_after_consolidation,
+        )
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("create_knowledge_page"))
@@ -2898,32 +2977,16 @@ def _register_create_knowledge_page(mcp: FastMCP, memory: MemoryEngine, config: 
                 refresh_after_consolidation: Legacy shorthand for trigger.refresh_after_consolidation.
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await _do_create_knowledge_page(
-                    memory,
-                    target_bank,
-                    _get_request_context(config),
-                    name=name,
-                    source_query=source_query,
-                    parent_id=parent_id,
-                    tags=tags,
-                    max_tokens=max_tokens,
-                    trigger=trigger,
-                    refresh_after_consolidation=refresh_after_consolidation,
-                )
-                return json.dumps(result, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except ValueError as e:
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error creating knowledge page: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="creating knowledge page",
+                run=lambda target_bank: _run(
+                    target_bank, name, source_query, parent_id, tags, max_tokens, trigger, refresh_after_consolidation
+                ),
+                value_error="expected",
+            )
 
     else:
 
@@ -2964,36 +3027,46 @@ def _register_create_knowledge_page(mcp: FastMCP, memory: MemoryEngine, config: 
                     instead to move the page onto a fixed UTC schedule.
                 refresh_after_consolidation: Legacy shorthand for trigger.refresh_after_consolidation.
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                return await _do_create_knowledge_page(
-                    memory,
-                    target_bank,
-                    _get_request_context(config),
-                    name=name,
-                    source_query=source_query,
-                    parent_id=parent_id,
-                    tags=tags,
-                    max_tokens=max_tokens,
-                    trigger=trigger,
-                    refresh_after_consolidation=refresh_after_consolidation,
-                )
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except ValueError as e:
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error creating knowledge page: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="creating knowledge page",
+                run=lambda target_bank: _run(
+                    target_bank, name, source_query, parent_id, tags, max_tokens, trigger, refresh_after_consolidation
+                ),
+                value_error="expected",
+            )
 
 
 def _register_update_knowledge_node(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the update_knowledge_node tool."""
 
+    async def _run(
+        target_bank: str,
+        node_id: str,
+        name: str | None,
+        parent_id: str | None,
+        source_query: str | None,
+        tags: list[str] | None,
+        max_tokens: int | None,
+        trigger: MentalModelTriggerInput | None,
+        refresh_after_consolidation: bool | None,
+    ) -> Any:
+        return await _do_update_knowledge_node(
+            memory,
+            target_bank,
+            _get_request_context(config),
+            node_id=node_id,
+            name=name,
+            parent_id=parent_id,
+            source_query=source_query,
+            tags=tags,
+            max_tokens=max_tokens,
+            trigger=trigger,
+            refresh_after_consolidation=refresh_after_consolidation,
+        )
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("update_knowledge_node"))
@@ -3032,33 +3105,24 @@ def _register_update_knowledge_node(mcp: FastMCP, memory: MemoryEngine, config: 
                     trigger.refresh_after_consolidation
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await _do_update_knowledge_node(
-                    memory,
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="updating knowledge node",
+                run=lambda target_bank: _run(
                     target_bank,
-                    _get_request_context(config),
-                    node_id=node_id,
-                    name=name,
-                    parent_id=parent_id,
-                    source_query=source_query,
-                    tags=tags,
-                    max_tokens=max_tokens,
-                    trigger=trigger,
-                    refresh_after_consolidation=refresh_after_consolidation,
-                )
-                return json.dumps(result, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except ValueError as e:
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error updating knowledge node: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+                    node_id,
+                    name,
+                    parent_id,
+                    source_query,
+                    tags,
+                    max_tokens,
+                    trigger,
+                    refresh_after_consolidation,
+                ),
+                value_error="expected",
+            )
 
     else:
 
@@ -3096,37 +3160,32 @@ def _register_update_knowledge_node(mcp: FastMCP, memory: MemoryEngine, config: 
                 refresh_after_consolidation: Pages only — legacy shorthand for
                     trigger.refresh_after_consolidation
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                return await _do_update_knowledge_node(
-                    memory,
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="updating knowledge node",
+                run=lambda target_bank: _run(
                     target_bank,
-                    _get_request_context(config),
-                    node_id=node_id,
-                    name=name,
-                    parent_id=parent_id,
-                    source_query=source_query,
-                    tags=tags,
-                    max_tokens=max_tokens,
-                    trigger=trigger,
-                    refresh_after_consolidation=refresh_after_consolidation,
-                )
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except ValueError as e:
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error updating knowledge node: {e}", exc_info=True)
-                return {"error": str(e)}
+                    node_id,
+                    name,
+                    parent_id,
+                    source_query,
+                    tags,
+                    max_tokens,
+                    trigger,
+                    refresh_after_consolidation,
+                ),
+                value_error="expected",
+            )
 
 
 def _register_delete_knowledge_node(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the delete_knowledge_node tool."""
 
+    async def _run(target_bank: str, node_id: str) -> Any:
+        return await _do_delete_knowledge_node(memory, target_bank, _get_request_context(config), node_id=node_id)
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("delete_knowledge_node"))
@@ -3144,21 +3203,14 @@ def _register_delete_knowledge_node(mcp: FastMCP, memory: MemoryEngine, config: 
                 node_id: The ID of the folder (`kf-...`) or page (`kp-...`) to delete
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await _do_delete_knowledge_node(
-                    memory, target_bank, _get_request_context(config), node_id=node_id
-                )
-                return json.dumps(result)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error deleting knowledge node: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="deleting knowledge node",
+                run=lambda target_bank: _run(target_bank, node_id),
+                indent=None,
+            )
 
     else:
 
@@ -3175,20 +3227,14 @@ def _register_delete_knowledge_node(mcp: FastMCP, memory: MemoryEngine, config: 
             Args:
                 node_id: The ID of the folder (`kf-...`) or page (`kp-...`) to delete
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                return await _do_delete_knowledge_node(
-                    memory, target_bank, _get_request_context(config), node_id=node_id
-                )
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error deleting knowledge node: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="deleting knowledge node",
+                run=lambda target_bank: _run(target_bank, node_id),
+                indent=None,
+            )
 
 
 # =========================================================================
@@ -3199,14 +3245,25 @@ def _register_delete_knowledge_node(mcp: FastMCP, memory: MemoryEngine, config: 
 def _register_list_directives(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the list_directives tool."""
 
+    async def _run(target_bank: str, tags: list[str] | None, active_only: bool, limit: int, offset: int) -> Any:
+        page = await memory.list_directives(
+            target_bank,
+            tags=tags,
+            active_only=active_only,
+            limit=limit,
+            offset=offset,
+            request_context=_get_request_context(config),
+        )
+        return {"items": page.items, "total": page.total}
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("list_directives"))
         async def list_directives(
             tags: list[str] | None = None,
             active_only: bool = True,
-            limit: int = 100,
-            offset: int = 0,
+            limit: _Limit1000 = 100,
+            offset: _Offset = 0,
             bank_id: str | None = None,
         ) -> str:
             """
@@ -3218,30 +3275,18 @@ def _register_list_directives(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
             Args:
                 tags: Optional tags to filter by
                 active_only: If True, only return active directives (default: True)
-                limit: Maximum number of results (default: 100)
+                limit: Maximum number of results, 1-1000 (default: 100)
                 offset: Pagination offset (default: 0). Page until the returned items add up to 'total'.
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                page = await memory.list_directives(
-                    target_bank,
-                    tags=tags,
-                    active_only=active_only,
-                    limit=limit,
-                    offset=offset,
-                    request_context=_get_request_context(config),
-                )
-                return json.dumps({"items": page.items, "total": page.total}, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error listing directives: {e}", exc_info=True)
-                return f'{{"error": "{e}", "items": []}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="listing directives",
+                run=lambda target_bank: _run(target_bank, tags, active_only, limit, offset),
+                error_extra={"items": []},
+            )
 
     else:
 
@@ -3249,8 +3294,8 @@ def _register_list_directives(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
         async def list_directives(
             tags: list[str] | None = None,
             active_only: bool = True,
-            limit: int = 100,
-            offset: int = 0,
+            limit: _Limit1000 = 100,
+            offset: _Offset = 0,
         ) -> dict:
             """
             List directives for this memory bank.
@@ -3261,33 +3306,35 @@ def _register_list_directives(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
             Args:
                 tags: Optional tags to filter by
                 active_only: If True, only return active directives (default: True)
-                limit: Maximum number of results (default: 100)
+                limit: Maximum number of results, 1-1000 (default: 100)
                 offset: Pagination offset (default: 0). Page until the returned items add up to 'total'.
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured", "items": []}
-
-                page = await memory.list_directives(
-                    target_bank,
-                    tags=tags,
-                    active_only=active_only,
-                    limit=limit,
-                    offset=offset,
-                    request_context=_get_request_context(config),
-                )
-                return {"items": page.items, "total": page.total}
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error listing directives: {e}", exc_info=True)
-                return {"error": str(e), "items": []}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="listing directives",
+                run=lambda target_bank: _run(target_bank, tags, active_only, limit, offset),
+                error_extra={"items": []},
+            )
 
 
 def _register_create_directive(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the create_directive tool."""
+
+    async def _run(
+        target_bank: str, name: str, content: str, priority: int, is_active: bool, tags: list[str] | None
+    ) -> Any:
+        directive = await memory.create_directive(
+            target_bank,
+            name=name,
+            content=content,
+            priority=priority,
+            is_active=is_active,
+            tags=tags,
+            request_context=_get_request_context(config),
+        )
+        return directive
 
     if config.include_bank_id_param:
 
@@ -3313,27 +3360,13 @@ def _register_create_directive(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
                 tags: Optional tags for filtering
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                directive = await memory.create_directive(
-                    target_bank,
-                    name=name,
-                    content=content,
-                    priority=priority,
-                    is_active=is_active,
-                    tags=tags,
-                    request_context=_get_request_context(config),
-                )
-                return json.dumps(directive, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error creating directive: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="creating directive",
+                run=lambda target_bank: _run(target_bank, name, content, priority, is_active, tags),
+            )
 
     else:
 
@@ -3357,31 +3390,27 @@ def _register_create_directive(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
                 is_active: Whether the directive is active (default: True)
                 tags: Optional tags for filtering
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                directive = await memory.create_directive(
-                    target_bank,
-                    name=name,
-                    content=content,
-                    priority=priority,
-                    is_active=is_active,
-                    tags=tags,
-                    request_context=_get_request_context(config),
-                )
-                return directive
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error creating directive: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="creating directive",
+                run=lambda target_bank: _run(target_bank, name, content, priority, is_active, tags),
+            )
 
 
 def _register_delete_directive(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the delete_directive tool."""
+
+    async def _run(target_bank: str, directive_id: str) -> Any:
+        deleted = await memory.delete_directive(
+            target_bank,
+            directive_id,
+            request_context=_get_request_context(config),
+        )
+        if not deleted:
+            raise _ToolError(f"Directive '{directive_id}' not found")
+        return {"status": "deleted", "directive_id": directive_id}
 
     if config.include_bank_id_param:
 
@@ -3399,25 +3428,14 @@ def _register_delete_directive(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
                 directive_id: The ID of the directive to delete
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                deleted = await memory.delete_directive(
-                    target_bank,
-                    directive_id,
-                    request_context=_get_request_context(config),
-                )
-                if not deleted:
-                    return json.dumps({"error": f"Directive '{directive_id}' not found"})
-                return json.dumps({"status": "deleted", "directive_id": directive_id})
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error deleting directive: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="deleting directive",
+                run=lambda target_bank: _run(target_bank, directive_id),
+                indent=None,
+            )
 
     else:
 
@@ -3433,25 +3451,14 @@ def _register_delete_directive(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
             Args:
                 directive_id: The ID of the directive to delete
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                deleted = await memory.delete_directive(
-                    target_bank,
-                    directive_id,
-                    request_context=_get_request_context(config),
-                )
-                if not deleted:
-                    return {"error": f"Directive '{directive_id}' not found"}
-                return {"status": "deleted", "directive_id": directive_id}
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error deleting directive: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="deleting directive",
+                run=lambda target_bank: _run(target_bank, directive_id),
+                indent=None,
+            )
 
 
 # =========================================================================
@@ -3462,14 +3469,35 @@ def _register_delete_directive(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
 def _register_list_memories(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the list_memories tool."""
 
+    async def _run(
+        target_bank: str,
+        type: str | None,
+        q: str | None,
+        limit: int,
+        offset: int,
+        tags: list[str] | None,
+        tags_match: TagsMatch,
+    ) -> Any:
+        result = await memory.list_memory_units(
+            target_bank,
+            fact_type=type,
+            search_query=q,
+            limit=limit,
+            offset=offset,
+            tags=tags,
+            tags_match=tags_match,
+            request_context=_get_request_context(config),
+        )
+        return result
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("list_memories"))
         async def list_memories(
             type: str | None = None,
             q: str | None = None,
-            limit: int = 100,
-            offset: int = 0,
+            limit: _Limit = 100,
+            offset: _Offset = 0,
             bank_id: str | None = None,
             tags: list[str] | None = None,
             tags_match: TagsMatch = "any",
@@ -3491,28 +3519,13 @@ def _register_list_memories(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
                     both also include untagged memories; 'any_strict'/'all_strict'
                     exclude untagged; 'exact' matches the tag set exactly.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await memory.list_memory_units(
-                    target_bank,
-                    fact_type=type,
-                    search_query=q,
-                    limit=limit,
-                    offset=offset,
-                    tags=tags,
-                    tags_match=tags_match,
-                    request_context=_get_request_context(config),
-                )
-                return json.dumps(result, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error listing memories: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="listing memories",
+                run=lambda target_bank: _run(target_bank, type, q, limit, offset, tags, tags_match),
+            )
 
     else:
 
@@ -3520,8 +3533,8 @@ def _register_list_memories(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
         async def list_memories(
             type: str | None = None,
             q: str | None = None,
-            limit: int = 100,
-            offset: int = 0,
+            limit: _Limit = 100,
+            offset: _Offset = 0,
             tags: list[str] | None = None,
             tags_match: TagsMatch = "any",
         ) -> dict:
@@ -3541,33 +3554,28 @@ def _register_list_memories(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
                     both also include untagged memories; 'any_strict'/'all_strict'
                     exclude untagged; 'exact' matches the tag set exactly.
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                result = await memory.list_memory_units(
-                    target_bank,
-                    fact_type=type,
-                    search_query=q,
-                    limit=limit,
-                    offset=offset,
-                    tags=tags,
-                    tags_match=tags_match,
-                    request_context=_get_request_context(config),
-                )
-                return result
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error listing memories: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="listing memories",
+                run=lambda target_bank: _run(target_bank, type, q, limit, offset, tags, tags_match),
+            )
 
 
 def _register_get_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the get_memory tool."""
 
+    async def _run(target_bank: str, memory_id: str) -> Any:
+        result = await memory.get_memory_unit(
+            target_bank,
+            memory_id,
+            request_context=_get_request_context(config),
+        )
+        if result is None:
+            raise _ToolError(f"Memory '{memory_id}' not found")
+        return result
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("get_memory"))
@@ -3584,25 +3592,13 @@ def _register_get_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCon
                 memory_id: The ID of the memory to retrieve
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await memory.get_memory_unit(
-                    target_bank,
-                    memory_id,
-                    request_context=_get_request_context(config),
-                )
-                if result is None:
-                    return json.dumps({"error": f"Memory '{memory_id}' not found"})
-                return json.dumps(result, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error getting memory: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="getting memory",
+                run=lambda target_bank: _run(target_bank, memory_id),
+            )
 
     else:
 
@@ -3618,25 +3614,13 @@ def _register_get_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCon
             Args:
                 memory_id: The ID of the memory to retrieve
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                result = await memory.get_memory_unit(
-                    target_bank,
-                    memory_id,
-                    request_context=_get_request_context(config),
-                )
-                if result is None:
-                    return {"error": f"Memory '{memory_id}' not found"}
-                return result
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error getting memory: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="getting memory",
+                run=lambda target_bank: _run(target_bank, memory_id),
+            )
 
 
 def _register_update_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
@@ -3662,6 +3646,33 @@ def _register_update_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
             To retire or restore a fact, use invalidate_memory instead.
     """
 
+    async def _run(
+        target_bank: str,
+        memory_id: str,
+        text: str | None,
+        context: str | None,
+        occurred_start: str | None,
+        occurred_end: str | None,
+        fact_type: str | None,
+        entities: list[str] | None,
+        resolve_entities: bool,
+    ) -> Any:
+        result = await memory.update_memory_unit(
+            target_bank,
+            memory_id,
+            text=text,
+            context=context,
+            occurred_start=occurred_start,
+            occurred_end=occurred_end,
+            new_fact_type=fact_type,
+            entities=entities,
+            resolve_entities=resolve_entities,
+            request_context=_get_request_context(config),
+        )
+        if result is None:
+            raise _ToolError(f"Memory '{memory_id}' not found")
+        return result
+
     if config.include_bank_id_param:
 
         @mcp.tool(description=_EDIT_DOC, annotations=_tool_annotations("update_memory"))
@@ -3681,34 +3692,24 @@ def _register_update_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
                 memory_id: The ID of the memory unit to edit.
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await memory.update_memory_unit(
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="updating memory",
+                run=lambda target_bank: _run(
                     target_bank,
                     memory_id,
-                    text=text,
-                    context=context,
-                    occurred_start=occurred_start,
-                    occurred_end=occurred_end,
-                    new_fact_type=fact_type,
-                    entities=entities,
-                    resolve_entities=resolve_entities,
-                    request_context=_get_request_context(config),
-                )
-                if result is None:
-                    return json.dumps({"error": f"Memory '{memory_id}' not found"})
-                return json.dumps(result, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except ValueError as e:
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error updating memory: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+                    text,
+                    context,
+                    occurred_start,
+                    occurred_end,
+                    fact_type,
+                    entities,
+                    resolve_entities,
+                ),
+                value_error="expected",
+            )
 
     else:
 
@@ -3727,34 +3728,24 @@ def _register_update_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
             Args:
                 memory_id: The ID of the memory unit to edit.
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                result = await memory.update_memory_unit(
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="updating memory",
+                run=lambda target_bank: _run(
                     target_bank,
                     memory_id,
-                    text=text,
-                    context=context,
-                    occurred_start=occurred_start,
-                    occurred_end=occurred_end,
-                    new_fact_type=fact_type,
-                    entities=entities,
-                    resolve_entities=resolve_entities,
-                    request_context=_get_request_context(config),
-                )
-                if result is None:
-                    return {"error": f"Memory '{memory_id}' not found"}
-                return result
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except ValueError as e:
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error updating memory: {e}", exc_info=True)
-                return {"error": str(e)}
+                    text,
+                    context,
+                    occurred_start,
+                    occurred_end,
+                    fact_type,
+                    entities,
+                    resolve_entities,
+                ),
+                value_error="expected",
+            )
 
 
 def _register_invalidate_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
@@ -3771,6 +3762,18 @@ def _register_invalidate_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPT
             Only raw world/experience facts can be invalidated; observations are derived.
     """
 
+    async def _run(target_bank: str, memory_id: str, reason: str | None, restore: bool) -> Any:
+        result = await memory.update_memory_unit(
+            target_bank,
+            memory_id,
+            state="valid" if restore else "invalidated",
+            reason=reason,
+            request_context=_get_request_context(config),
+        )
+        if result is None:
+            raise _ToolError(f"Memory '{memory_id}' not found")
+        return result
+
     if config.include_bank_id_param:
 
         @mcp.tool(description=_INVALIDATE_DOC, annotations=_tool_annotations("invalidate_memory"))
@@ -3787,29 +3790,14 @@ def _register_invalidate_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPT
                 restore: Set True to restore a previously invalidated fact.
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await memory.update_memory_unit(
-                    target_bank,
-                    memory_id,
-                    state="valid" if restore else "invalidated",
-                    reason=reason,
-                    request_context=_get_request_context(config),
-                )
-                if result is None:
-                    return json.dumps({"error": f"Memory '{memory_id}' not found"})
-                return json.dumps(result, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except ValueError as e:
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error invalidating memory: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="invalidating memory",
+                run=lambda target_bank: _run(target_bank, memory_id, reason, restore),
+                value_error="expected",
+            )
 
     else:
 
@@ -3825,29 +3813,14 @@ def _register_invalidate_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPT
                 reason: Optional free-text reason recorded when invalidating.
                 restore: Set True to restore a previously invalidated fact.
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                result = await memory.update_memory_unit(
-                    target_bank,
-                    memory_id,
-                    state="valid" if restore else "invalidated",
-                    reason=reason,
-                    request_context=_get_request_context(config),
-                )
-                if result is None:
-                    return {"error": f"Memory '{memory_id}' not found"}
-                return result
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except ValueError as e:
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error invalidating memory: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="invalidating memory",
+                run=lambda target_bank: _run(target_bank, memory_id, reason, restore),
+                value_error="expected",
+            )
 
 
 # =========================================================================
@@ -3858,12 +3831,23 @@ def _register_invalidate_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPT
 def _register_list_documents(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the list_documents tool."""
 
+    async def _run(target_bank: str, q: str | None, limit: int, offset: int) -> Any:
+        result = await memory.list_documents(
+            target_bank,
+            search_query=q,
+            limit=limit,
+            offset=offset,
+            request_context=_get_request_context(config),
+        )
+        return result
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("list_documents"))
         async def list_documents(
             q: str | None = None,
-            limit: int = 100,
+            limit: _Limit = 100,
+            offset: _Offset = 0,
             bank_id: str | None = None,
         ) -> str:
             """
@@ -3875,33 +3859,24 @@ def _register_list_documents(mcp: FastMCP, memory: MemoryEngine, config: MCPTool
             Args:
                 q: Optional search query to filter documents
                 limit: Maximum number of results (default: 100)
+                offset: Pagination offset (default: 0). Page until the returned items add up to 'total'.
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await memory.list_documents(
-                    target_bank,
-                    search_query=q,
-                    limit=limit,
-                    request_context=_get_request_context(config),
-                )
-                return json.dumps(result, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error listing documents: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="listing documents",
+                run=lambda target_bank: _run(target_bank, q, limit, offset),
+            )
 
     else:
 
         @mcp.tool(annotations=_tool_annotations("list_documents"))
         async def list_documents(
             q: str | None = None,
-            limit: int = 100,
+            limit: _Limit = 100,
+            offset: _Offset = 0,
         ) -> dict:
             """
             List documents in this memory bank.
@@ -3912,30 +3887,32 @@ def _register_list_documents(mcp: FastMCP, memory: MemoryEngine, config: MCPTool
             Args:
                 q: Optional search query to filter documents
                 limit: Maximum number of results (default: 100)
+                offset: Pagination offset (default: 0). Page until the returned items add up to 'total'.
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                result = await memory.list_documents(
-                    target_bank,
-                    search_query=q,
-                    limit=limit,
-                    request_context=_get_request_context(config),
-                )
-                return result
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error listing documents: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="listing documents",
+                run=lambda target_bank: _run(target_bank, q, limit, offset),
+            )
 
 
 def _register_get_document(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the get_document tool."""
 
+    async def _run(target_bank: str, document_id: str) -> Any:
+        result = await memory.get_document(
+            document_id,
+            target_bank,
+            request_context=_get_request_context(config),
+        )
+        if result is None:
+            raise _ToolError(f"Document '{document_id}' not found")
+        # An engine-internal carrier a store-owned bank's document has and a SQL one does not.
+        result.pop("attachment_filenames", None)
+        return result
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("get_document"))
@@ -3952,25 +3929,13 @@ def _register_get_document(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsC
                 document_id: The ID of the document to retrieve
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await memory.get_document(
-                    document_id,
-                    target_bank,
-                    request_context=_get_request_context(config),
-                )
-                if result is None:
-                    return json.dumps({"error": f"Document '{document_id}' not found"})
-                return json.dumps(result, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error getting document: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="getting document",
+                run=lambda target_bank: _run(target_bank, document_id),
+            )
 
     else:
 
@@ -3986,30 +3951,26 @@ def _register_get_document(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsC
             Args:
                 document_id: The ID of the document to retrieve
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                result = await memory.get_document(
-                    document_id,
-                    target_bank,
-                    request_context=_get_request_context(config),
-                )
-                if result is None:
-                    return {"error": f"Document '{document_id}' not found"}
-                return result
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error getting document: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="getting document",
+                run=lambda target_bank: _run(target_bank, document_id),
+            )
 
 
 def _register_delete_document(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the delete_document tool."""
 
+    async def _run(target_bank: str, document_id: str) -> Any:
+        result = await memory.delete_document(
+            document_id,
+            target_bank,
+            request_context=_get_request_context(config),
+        )
+        return {"status": "deleted", "document_id": document_id, **result}
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("delete_document"))
@@ -4026,23 +3987,14 @@ def _register_delete_document(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
                 document_id: The ID of the document to delete
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await memory.delete_document(
-                    document_id,
-                    target_bank,
-                    request_context=_get_request_context(config),
-                )
-                return json.dumps({"status": "deleted", "document_id": document_id, **result}, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error deleting document: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="deleting document",
+                run=lambda target_bank: _run(target_bank, document_id),
+                indent=None,
+            )
 
     else:
 
@@ -4058,23 +4010,14 @@ def _register_delete_document(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
             Args:
                 document_id: The ID of the document to delete
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                result = await memory.delete_document(
-                    document_id,
-                    target_bank,
-                    request_context=_get_request_context(config),
-                )
-                return {"status": "deleted", "document_id": document_id, **result}
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error deleting document: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="deleting document",
+                run=lambda target_bank: _run(target_bank, document_id),
+                indent=None,
+            )
 
 
 # =========================================================================
@@ -4085,12 +4028,29 @@ def _register_delete_document(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
 def _register_list_operations(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the list_operations tool."""
 
+    async def _run(
+        target_bank: str, status: str | None, type: str | None, limit: int, offset: int, exclude_parents: bool
+    ) -> Any:
+        result = await memory.list_operations(
+            target_bank,
+            status=status,
+            task_type=type,
+            limit=limit,
+            offset=offset,
+            exclude_parents=exclude_parents,
+            request_context=_get_request_context(config),
+        )
+        return result
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("list_operations"))
         async def list_operations(
             status: str | None = None,
-            limit: int = 20,
+            type: str | None = None,
+            limit: _OperationsLimit = 20,
+            offset: _Offset = 0,
+            exclude_parents: bool = False,
             bank_id: str | None = None,
         ) -> str:
             """
@@ -4100,34 +4060,30 @@ def _register_list_operations(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
 
             Args:
                 status: Filter by status: 'pending', 'running', 'completed', 'failed', 'cancelled'
-                limit: Maximum number of results (default: 20)
+                type: Filter by operation type: 'retain', 'consolidation', 'refresh_mental_model',
+                    'file_convert_retain', 'webhook_delivery'
+                limit: Maximum number of results, 1-100 (default: 20)
+                offset: Number of operations to skip (default: 0). Page until you reach 'total'.
+                exclude_parents: Exclude parent batch operations (default: False)
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await memory.list_operations(
-                    target_bank,
-                    status=status,
-                    limit=limit,
-                    request_context=_get_request_context(config),
-                )
-                return json.dumps(result, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error listing operations: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="listing operations",
+                run=lambda target_bank: _run(target_bank, status, type, limit, offset, exclude_parents),
+            )
 
     else:
 
         @mcp.tool(annotations=_tool_annotations("list_operations"))
         async def list_operations(
             status: str | None = None,
-            limit: int = 20,
+            type: str | None = None,
+            limit: _OperationsLimit = 20,
+            offset: _Offset = 0,
+            exclude_parents: bool = False,
         ) -> dict:
             """
             List async operations for this memory bank.
@@ -4136,31 +4092,32 @@ def _register_list_operations(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
 
             Args:
                 status: Filter by status: 'pending', 'running', 'completed', 'failed', 'cancelled'
-                limit: Maximum number of results (default: 20)
+                type: Filter by operation type: 'retain', 'consolidation', 'refresh_mental_model',
+                    'file_convert_retain', 'webhook_delivery'
+                limit: Maximum number of results, 1-100 (default: 20)
+                offset: Number of operations to skip (default: 0). Page until you reach 'total'.
+                exclude_parents: Exclude parent batch operations (default: False)
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                result = await memory.list_operations(
-                    target_bank,
-                    status=status,
-                    limit=limit,
-                    request_context=_get_request_context(config),
-                )
-                return result
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error listing operations: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="listing operations",
+                run=lambda target_bank: _run(target_bank, status, type, limit, offset, exclude_parents),
+            )
 
 
 def _register_get_operation(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the get_operation tool."""
 
+    async def _run(target_bank: str, operation_id: str) -> Any:
+        result = await memory.get_operation_status(
+            target_bank,
+            operation_id,
+            request_context=_get_request_context(config),
+        )
+        return result
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("get_operation"))
@@ -4177,23 +4134,13 @@ def _register_get_operation(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
                 operation_id: The ID of the operation to check
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await memory.get_operation_status(
-                    target_bank,
-                    operation_id,
-                    request_context=_get_request_context(config),
-                )
-                return json.dumps(result, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error getting operation: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="getting operation",
+                run=lambda target_bank: _run(target_bank, operation_id),
+            )
 
     else:
 
@@ -4209,28 +4156,26 @@ def _register_get_operation(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
             Args:
                 operation_id: The ID of the operation to check
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                result = await memory.get_operation_status(
-                    target_bank,
-                    operation_id,
-                    request_context=_get_request_context(config),
-                )
-                return result
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error getting operation: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="getting operation",
+                run=lambda target_bank: _run(target_bank, operation_id),
+            )
 
 
 def _register_cancel_operation(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the cancel_operation tool."""
 
+    async def _run(target_bank: str, operation_id: str) -> Any:
+        result = await memory.cancel_operation(
+            target_bank,
+            operation_id,
+            request_context=_get_request_context(config),
+        )
+        return result
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("cancel_operation"))
@@ -4245,23 +4190,13 @@ def _register_cancel_operation(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
                 operation_id: The ID of the operation to cancel
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await memory.cancel_operation(
-                    target_bank,
-                    operation_id,
-                    request_context=_get_request_context(config),
-                )
-                return json.dumps(result, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error cancelling operation: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="cancelling operation",
+                run=lambda target_bank: _run(target_bank, operation_id),
+            )
 
     else:
 
@@ -4275,23 +4210,13 @@ def _register_cancel_operation(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
             Args:
                 operation_id: The ID of the operation to cancel
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                result = await memory.cancel_operation(
-                    target_bank,
-                    operation_id,
-                    request_context=_get_request_context(config),
-                )
-                return result
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error cancelling operation: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="cancelling operation",
+                run=lambda target_bank: _run(target_bank, operation_id),
+            )
 
 
 # =========================================================================
@@ -4302,12 +4227,23 @@ def _register_cancel_operation(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
 def _register_list_tags(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the list_tags tool."""
 
+    async def _run(target_bank: str, q: str | None, limit: int, offset: int) -> Any:
+        result = await memory.list_tags(
+            target_bank,
+            pattern=q,
+            limit=limit,
+            offset=offset,
+            request_context=_get_request_context(config),
+        )
+        return result
+
     if config.include_bank_id_param:
 
         @mcp.tool(annotations=_tool_annotations("list_tags"))
         async def list_tags(
             q: str | None = None,
-            limit: int = 100,
+            limit: _Limit = 100,
+            offset: _Offset = 0,
             bank_id: str | None = None,
         ) -> str:
             """
@@ -4318,33 +4254,24 @@ def _register_list_tags(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConf
             Args:
                 q: Optional pattern to filter tags (e.g., 'project:*')
                 limit: Maximum number of results (default: 100)
+                offset: Pagination offset (default: 0). Page until the returned items add up to 'total'.
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await memory.list_tags(
-                    target_bank,
-                    pattern=q,
-                    limit=limit,
-                    request_context=_get_request_context(config),
-                )
-                return json.dumps(result, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error listing tags: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="listing tags",
+                run=lambda target_bank: _run(target_bank, q, limit, offset),
+            )
 
     else:
 
         @mcp.tool(annotations=_tool_annotations("list_tags"))
         async def list_tags(
             q: str | None = None,
-            limit: int = 100,
+            limit: _Limit = 100,
+            offset: _Offset = 0,
         ) -> dict:
             """
             List tags used in this memory bank.
@@ -4354,29 +4281,30 @@ def _register_list_tags(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConf
             Args:
                 q: Optional pattern to filter tags (e.g., 'project:*')
                 limit: Maximum number of results (default: 100)
+                offset: Pagination offset (default: 0). Page until the returned items add up to 'total'.
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                result = await memory.list_tags(
-                    target_bank,
-                    pattern=q,
-                    limit=limit,
-                    request_context=_get_request_context(config),
-                )
-                return result
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error listing tags: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="listing tags",
+                run=lambda target_bank: _run(target_bank, q, limit, offset),
+            )
 
 
 def _register_get_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the get_bank tool."""
+
+    async def _run(target_bank: str) -> Any:
+        profile = await memory.get_bank_profile(
+            target_bank,
+            request_context=_get_request_context(config),
+        )
+        if profile is None:
+            raise _ToolError(f"Bank '{target_bank}' not found")
+        if "disposition" in profile and hasattr(profile["disposition"], "model_dump"):
+            profile["disposition"] = profile["disposition"].model_dump()
+        return profile
 
     if config.include_bank_id_param:
 
@@ -4392,27 +4320,13 @@ def _register_get_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfi
             Args:
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                profile = await memory.get_bank_profile(
-                    target_bank,
-                    request_context=_get_request_context(config),
-                    create_if_missing=False,
-                )
-                if profile is None:
-                    return json.dumps({"error": f"Bank '{target_bank}' not found"})
-                if "disposition" in profile and hasattr(profile["disposition"], "model_dump"):
-                    profile["disposition"] = profile["disposition"].model_dump()
-                return json.dumps(profile, indent=2, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error getting bank: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="getting bank",
+                run=lambda target_bank: _run(target_bank),
+            )
 
     else:
 
@@ -4423,27 +4337,13 @@ def _register_get_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfi
 
             Returns bank metadata including name, disposition, and mission.
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                profile = await memory.get_bank_profile(
-                    target_bank,
-                    request_context=_get_request_context(config),
-                    create_if_missing=False,
-                )
-                if profile is None:
-                    return {"error": f"Bank '{target_bank}' not found"}
-                if "disposition" in profile and hasattr(profile["disposition"], "model_dump"):
-                    profile["disposition"] = profile["disposition"].model_dump()
-                return profile
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error getting bank: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="getting bank",
+                run=lambda target_bank: _run(target_bank),
+            )
 
 
 def _register_get_bank_stats(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
@@ -4462,9 +4362,9 @@ def _register_get_bank_stats(mcp: FastMCP, memory: MemoryEngine, config: MCPTool
             bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
         """
         try:
-            target_bank = bank_id or config.bank_id_resolver()
+            target_bank = await _resolve_bank(config, bank_id)
             if target_bank is None:
-                return '{"error": "No bank_id configured"}'
+                return _error_json("No bank_id configured")
 
             result = await memory.get_bank_stats(
                 target_bank,
@@ -4476,7 +4376,7 @@ def _register_get_bank_stats(mcp: FastMCP, memory: MemoryEngine, config: MCPTool
             return json.dumps({"error": str(e)})
         except Exception as e:
             logger.error(f"Error getting bank stats: {e}", exc_info=True)
-            return f'{{"error": "{e}"}}'
+            return _error_json(e)
 
 
 async def _do_update_bank(
@@ -4512,6 +4412,21 @@ async def _do_update_bank(
 
 def _register_update_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the update_bank tool."""
+
+    async def _run(
+        target_bank: str,
+        name: str | None,
+        mission: str | None,
+        config_updates: dict[str, Any] | None,
+    ) -> Any:
+        return await _do_update_bank(
+            memory,
+            target_bank,
+            _get_request_context(config),
+            name=name,
+            mission=mission,
+            config_updates=config_updates,
+        )
 
     if config.include_bank_id_param:
 
@@ -4553,26 +4468,14 @@ def _register_update_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
                     Any configurable field name is accepted (use Python field names).
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await _do_update_bank(
-                    memory,
-                    target_bank,
-                    _get_request_context(config),
-                    name=name,
-                    mission=mission,
-                    config_updates=config_updates,
-                )
-                return json.dumps(result, indent=2, default=str)
-            except (OperationValidationError, ValueError) as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error updating bank: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="updating bank",
+                run=lambda target_bank: _run(target_bank, name, mission, config_updates),
+                value_error="rejection",
+            )
 
     else:
 
@@ -4612,30 +4515,25 @@ def _register_update_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
                     - mcp_enabled_tools: Tool allowlist for this bank.
                     Any configurable field name is accepted (use Python field names).
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                result = await _do_update_bank(
-                    memory,
-                    target_bank,
-                    _get_request_context(config),
-                    name=name,
-                    mission=mission,
-                    config_updates=config_updates,
-                )
-                return result
-            except (OperationValidationError, ValueError) as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error updating bank: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="updating bank",
+                run=lambda target_bank: _run(target_bank, name, mission, config_updates),
+                value_error="rejection",
+            )
 
 
 def _register_delete_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the delete_bank tool."""
+
+    async def _run(target_bank: str) -> Any:
+        result = await memory.delete_bank(
+            target_bank,
+            request_context=_get_request_context(config),
+        )
+        return {"status": "deleted", "bank_id": target_bank, **result}
 
     if config.include_bank_id_param:
 
@@ -4652,22 +4550,14 @@ def _register_delete_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
             Args:
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await memory.delete_bank(
-                    target_bank,
-                    request_context=_get_request_context(config),
-                )
-                return json.dumps({"status": "deleted", "bank_id": target_bank, **result}, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error deleting bank: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="deleting bank",
+                run=lambda target_bank: _run(target_bank),
+                indent=None,
+            )
 
     else:
 
@@ -4679,26 +4569,27 @@ def _register_delete_bank(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCo
             WARNING: This permanently deletes the bank and all its memories, documents,
             mental models, directives, and other data. This action cannot be undone.
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                result = await memory.delete_bank(
-                    target_bank,
-                    request_context=_get_request_context(config),
-                )
-                return {"status": "deleted", "bank_id": target_bank, **result}
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error deleting bank: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="deleting bank",
+                run=lambda target_bank: _run(target_bank),
+                indent=None,
+            )
 
 
 def _register_clear_memories(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the clear_memories tool."""
+
+    async def _run(target_bank: str, type: str | None) -> Any:
+        result = await memory.delete_bank(
+            target_bank,
+            fact_type=type,
+            delete_bank_profile=False,
+            request_context=_get_request_context(config),
+        )
+        return {"status": "cleared", "bank_id": target_bank, **result}
 
     if config.include_bank_id_param:
 
@@ -4716,24 +4607,14 @@ def _register_clear_memories(mcp: FastMCP, memory: MemoryEngine, config: MCPTool
                 type: Optional fact type filter: 'world', 'experience', or 'observation'. If not specified, clears all.
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
-            try:
-                target_bank = bank_id or config.bank_id_resolver()
-                if target_bank is None:
-                    return '{"error": "No bank_id configured"}'
-
-                result = await memory.delete_bank(
-                    target_bank,
-                    fact_type=type,
-                    delete_bank_profile=False,
-                    request_context=_get_request_context(config),
-                )
-                return json.dumps({"status": "cleared", "bank_id": target_bank, **result}, default=str)
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return json.dumps({"error": str(e)})
-            except Exception as e:
-                logger.error(f"Error clearing memories: {e}", exc_info=True)
-                return f'{{"error": "{e}"}}'
+            return await _run_tool(
+                config,
+                bank_id=bank_id,
+                as_json=True,
+                action="clearing memories",
+                run=lambda target_bank: _run(target_bank, type),
+                indent=None,
+            )
 
     else:
 
@@ -4749,21 +4630,11 @@ def _register_clear_memories(mcp: FastMCP, memory: MemoryEngine, config: MCPTool
             Args:
                 type: Optional fact type filter: 'world', 'experience', or 'observation'. If not specified, clears all.
             """
-            try:
-                target_bank = config.bank_id_resolver()
-                if target_bank is None:
-                    return {"error": "No bank_id configured"}
-
-                result = await memory.delete_bank(
-                    target_bank,
-                    fact_type=type,
-                    delete_bank_profile=False,
-                    request_context=_get_request_context(config),
-                )
-                return {"status": "cleared", "bank_id": target_bank, **result}
-            except OperationValidationError as e:
-                logger.warning(f"Operation rejected: {e}")
-                return {"error": str(e)}
-            except Exception as e:
-                logger.error(f"Error clearing memories: {e}", exc_info=True)
-                return {"error": str(e)}
+            return await _run_tool(
+                config,
+                bank_id=None,
+                as_json=False,
+                action="clearing memories",
+                run=lambda target_bank: _run(target_bank, type),
+                indent=None,
+            )

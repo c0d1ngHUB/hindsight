@@ -4,6 +4,7 @@ Pytest configuration and shared fixtures.
 
 import asyncio
 import importlib.util
+import inspect
 import os
 from pathlib import Path
 
@@ -68,10 +69,12 @@ async def _teardown_memory_engine(mem: MemoryEngine) -> None:
 
     LLM-trace recorders live in a process-global registry; ``MemoryEngine.close()`` is
     the only thing that removes the engine's recorder from it. If close() is skipped
-    (pool already closing) or raises before that step, the recorder leaks and a later
-    test's LLM calls get recorded into the shared DB — the flaky
-    test_llm_trace::test_disabled_writes_no_rows (#2229). Unregister unconditionally;
-    it's a no-op when close() already did it.
+    (pool already closing) or raises before that step, the recorder leaks and keeps
+    receiving every later test's LLM calls, writing rows for their banks through a
+    pool nobody owns. That used to flake a trace test that proved tracing-off by
+    counting rows in the shared table; that test now asserts on its own recorder
+    instead (#2229), but a recorder outliving its engine is still wrong. Unregister
+    unconditionally; it's a no-op when close() already did it.
     """
     try:
         if mem._pool and not mem._pool._closing:
@@ -82,18 +85,58 @@ async def _teardown_memory_engine(mem: MemoryEngine) -> None:
         unregister_span_recorder(mem._llm_recorder)
 
 
+@pytest_asyncio.fixture
+async def _close_aiohttp_sessions():
+    """Close the aiohttp sessions a test's clients opened, on the test's own loop.
+
+    Providers open a session per loop lazily and have no close hook, so without this
+    each async test's loop ends with open sessions and aiohttp logs "Unclosed client
+    session" for every one of them.
+    """
+    from hindsight_api.engine.aiohttp_session import close_loop_sessions
+
+    yield
+    await close_loop_sessions()
+
+
+def pytest_collection_modifyitems(config, items):
+    # Only async tests: an async autouse fixture would give every sync test a loop too.
+    for item in items:
+        if inspect.iscoroutinefunction(getattr(item, "obj", None)):
+            item.fixturenames.append("_close_aiohttp_sessions")
+
+
+@pytest.fixture(autouse=True)
+def _reset_config_cache():
+    """Let a test's ``monkeypatch.setenv`` actually reach the code under test.
+
+    ``HindsightConfig`` is built once and cached for the process, and every
+    ``HINDSIGHT_API_*`` value is now read off it rather than from ``os.environ`` at
+    the point of use. Without this, a test that sets an environment variable and
+    then calls the code would be read against whatever config the *first* test in
+    this xdist worker happened to build — the value would silently not apply, and
+    which tests noticed would depend on file ordering.
+
+    Clearing on the way out as well keeps a config built from one test's patched
+    environment from outliving it.
+    """
+    from hindsight_api.config import clear_config_cache
+
+    clear_config_cache()
+    yield
+    clear_config_cache()
+
+
 @pytest.fixture(autouse=True)
 def _cleanup_leaked_span_recorders():
     """Fail-safe for the process-global LLM-trace recorder registry (#2229).
 
     ``MemoryEngine.__init__`` registers its recorder in the shared registry, and
     only ``close()`` removes it. Tests that construct an engine directly (without
-    ``_teardown_memory_engine``/``close()``) leak an *enabled* recorder; a later
-    test's LLM calls then get recorded into the shared DB, flaking
-    ``test_llm_trace::test_disabled_writes_no_rows`` (it observes rows for its
-    bank even though its own recorder is disabled). ``_teardown_memory_engine``
-    guards the fixtures; this guards everything else by dropping any recorder a
-    test added to the registry.
+    ``_teardown_memory_engine``/``close()``) leak an *enabled* recorder, which then
+    records every later test's LLM calls into the shared ``llm_requests`` table under
+    their bank ids (#2229). ``_teardown_memory_engine`` guards the fixtures; this
+    guards everything else by dropping any recorder a test added to the registry.
     """
     from hindsight_api.tracing import get_span_recorder
 
@@ -236,10 +279,24 @@ def pg0_db_url(db_url, tmp_path_factory, worker_id):
             # Bump max_connections so 8 xdist workers * pool_max_size=15 fits well
             # under the cap (postgres default is 100, which is easy to exhaust now
             # that consolidation_llm_parallelism=4 increases peak conns per op).
+            # `log_lock_waits` is what makes a red CI run readable. Eight workers share
+            # this one server, so a single statement holding AccessExclusiveLock (a
+            # TRUNCATE, a non-concurrent index drop) stalls every other worker until
+            # pytest-timeout kills them all at once — seven unrelated tests failing with
+            # `Timeout (>300.0s)` in the same second, which looks like seven bugs and is
+            # one lock. With this on, the server names the blocker and the blocked
+            # statement, and `deadlock detected`'s "See server log for query details"
+            # finally has a log to see (CI uploads it on failure; see test.yml).
             pg0 = EmbeddedPostgres(
                 name=pg0_instance_name,
                 port=pg0_instance_port,
-                config={"max_connections": "300"},
+                config={
+                    "max_connections": "300",
+                    "log_lock_waits": "on",
+                    # Report a wait well before pytest-timeout's 300s, so the log shows
+                    # the stall building rather than only the corpses.
+                    "deadlock_timeout": "1s",
+                },
             )
 
             # Run ensure_running in a new event loop
@@ -279,18 +336,34 @@ def _cleanup_stale_test_data(db_url: str) -> None:
     (3 per bank × thousands of test banks = tens of thousands of indexes).
     This eventually causes 'out of shared memory' errors because PostgreSQL
     tracks all indexes in shared lock tables.
+
+    Every statement here is best-effort — it only removes residue from EARLIER
+    runs, so skipping any of it costs nothing this run. What it must never do is
+    wait: ``DROP INDEX`` and ``TRUNCATE`` take AccessExclusiveLock on tables the
+    other seven xdist workers are using, and a lock request that queues puts every
+    later reader behind it, up to pytest-timeout's 300s. ``lock_timeout`` makes
+    such a request fail in 2s instead, and the per-statement ``except``es below turn
+    that into a skip. Without it one unlucky overlap fails a dozen unrelated tests
+    at once.
     """
     import asyncpg
 
     async def _do_cleanup():
         conn = await asyncpg.connect(db_url)
         try:
+            await conn.execute("SET lock_timeout = '2s'")
             idx_rows = await conn.fetch(
                 "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND indexname LIKE 'idx_mu_emb_%'"
             )
-            if idx_rows:
-                for row in idx_rows:
+            for row in idx_rows:
+                try:
                     await conn.execute(f'DROP INDEX IF EXISTS public."{row["indexname"]}"')
+                except Exception:
+                    # Same bargain as the truncates below: a drop that cannot get the
+                    # lock within `lock_timeout` is residue left for the next run, not a
+                    # reason to fail this one. Unguarded it would raise out of a
+                    # session-scoped fixture and error every test on this worker.
+                    pass
 
             # Truncate test data in dependency order
             for table in [
@@ -505,11 +578,7 @@ def _skip_without_local_ml(what: str) -> None:
     """Skip rather than error when the local ML stack is not installed.
 
     The ``local-ml`` extra (sentence-transformers, transformers, torch) is optional: a
-    deployment using TEI/OpenAI/Cohere for embeddings and reranking never installs it,
-    and a free-threaded build may deliberately leave it out -- importing
-    ``sentence_transformers`` re-enables the GIL, so a process that wants to stay
-    free-threaded cannot load the local models. (torch, tokenizers, safetensors and
-    transformers are all fine on their own; see ``hindsight_api/_free_threading.py``.)
+    deployment using TEI/OpenAI/Cohere for embeddings and reranking never installs it.
 
     Without this, every DB-backed test collapses into an ImportError from deep inside
     fixture setup ("sentence-transformers is required for LocalSTEmbeddings"), which

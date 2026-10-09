@@ -31,6 +31,8 @@ from hindsight_api.engine.structured_output import provider_json_schema
 from hindsight_api.metrics import get_metrics_collector
 from hindsight_api.worker.stage import set_stage
 
+from ..response_models import LLMCallResult
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -593,10 +595,8 @@ class GitHubCopilotLLM(LLMInterface):
         max_backoff: float = 60.0,
         skip_validation: bool = False,
         strict_schema: bool = False,
-        return_usage: bool = False,
-        cached_prefix: str | None = None,
         attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
-    ) -> Any:
+    ) -> LLMCallResult:
         start_time = time.time()
 
         for attempt in range(max_retries + 1):
@@ -634,6 +634,7 @@ class GitHubCopilotLLM(LLMInterface):
                         input_tokens=invocation.usage.input_tokens,
                         output_tokens=invocation.usage.output_tokens,
                         cached_tokens=invocation.usage.cached_tokens,
+                        thoughts_tokens=invocation.usage.thoughts_tokens,
                     )
                 )
 
@@ -662,9 +663,7 @@ class GitHubCopilotLLM(LLMInterface):
                     scope=scope,
                     duration=duration,
                 )
-                if return_usage:
-                    return result, invocation.usage
-                return result
+                return LLMCallResult(content=result, usage=invocation.usage)
             except ValidationError:
                 raise
             except Exception as error:
@@ -702,8 +701,6 @@ class GitHubCopilotLLM(LLMInterface):
         initial_backoff: float = 1.0,
         max_backoff: float = 30.0,
         tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_AUTO,
-        cached_prefix: str | None = None,
-        cached_prefix_message_count: int = 0,
         attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> LLMToolCallResult:
         start_time = time.time()
@@ -754,6 +751,7 @@ class GitHubCopilotLLM(LLMInterface):
                         input_tokens=invocation.usage.input_tokens,
                         output_tokens=invocation.usage.output_tokens,
                         cached_tokens=invocation.usage.cached_tokens,
+                        thoughts_tokens=invocation.usage.thoughts_tokens,
                     )
                 )
 
@@ -839,6 +837,7 @@ class GitHubCopilotLLM(LLMInterface):
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
                 cached_tokens=usage.cached_tokens,
+                thoughts_tokens=usage.thoughts_tokens,
                 duration=duration,
                 finish_reason=invocation.finish_reason,
                 error=None,

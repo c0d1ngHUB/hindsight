@@ -7,12 +7,12 @@ Handles insertion of facts into the database.
 import json
 import logging
 import uuid
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
 from ...config import _get_raw_config
 from ..memory_engine import fq_table
-from ..metadata_utils import drop_null_values
 from .bank_utils import create_bank_row_on_conn
 from .fact_extraction import _sanitize_text
 from .types import ProcessedFact
@@ -30,16 +30,15 @@ async def get_document_content(
     bank_id: str,
     document_id: str,
 ) -> str | None:
-    """Fetch the original_text of an existing document.
+    """Fetch the original_text of an existing document, from whichever store holds it.
 
     Returns None if the document does not exist.
     """
-    row = await conn.fetchval(
-        f"SELECT original_text FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2",
-        document_id,
-        bank_id,
+    from ..memories import get_memories
+
+    return await get_memories().document_original_text(
+        conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id
     )
-    return row
 
 
 async def count_document_memory_units(
@@ -53,13 +52,15 @@ async def count_document_memory_units(
     by the ``retain.completed`` webhook. Zero means the document is stored but
     unreachable through recall/reflect — only memory units carry embeddings, so a
     document without them cannot be retrieved until it is reprocessed (#3040).
+
+    Asked of the store: one that keeps memories outside SQL has no `memory_units` rows, and
+    counting them reported every such document as having none.
     """
-    count = await conn.fetchval(
-        f"SELECT COUNT(*) FROM {fq_table('memory_units')} WHERE bank_id = $1 AND document_id = $2",
-        bank_id,
-        document_id,
+    from ..memories import get_memories
+
+    return await get_memories().count_document_memories(
+        conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id
     )
-    return int(count or 0)
 
 
 async def insert_facts_batch(
@@ -146,7 +147,9 @@ async def ensure_bank_exists(conn, bank_id: str, *, ops) -> None:
 async def delete_stale_observations_for_memories(
     conn,
     bank_id: str,
-    fact_ids: "list[str | uuid.UUID]",
+    # `Sequence`, not `list`: a list is invariant, so `list[str]` -- what every caller actually
+    # holds -- is not a `list[str | UUID]`. Nothing here mutates it; it is iterated and bound.
+    fact_ids: "Sequence[str | uuid.UUID]",
     ops=None,
 ) -> int:
     """Delete observations whose source memories are about to be removed.
@@ -154,7 +157,7 @@ async def delete_stale_observations_for_memories(
     Mirrors the cleanup performed by ``MemoryEngine.delete_document`` so that
     every code path that removes memories also removes the observations derived
     from them. Without this, ingesting a fresh version of a document via the
-    retain pipeline (which does a full-replace ``DELETE FROM documents``
+    retain pipeline (which does a full-replace delete of the document row and its
     cascade) used to leave orphan observations pointing at memory IDs that no
     longer existed.
 
@@ -180,7 +183,9 @@ async def delete_stale_observations_for_memories(
         ops=ops,
         fq_table=fq_table,
         bank_id=bank_id,
-        fact_ids=fact_ids,
+        # The seam declares `list`; this function now takes a Sequence so its own callers are
+        # not forced to copy. Materialise here rather than widen a method extensions override.
+        fact_ids=list(fact_ids),
     )
 
 
@@ -194,6 +199,7 @@ async def handle_document_tracking(
     document_tags: list[str] | None = None,
     ops=None,
     store_document_text: bool | None = None,
+    attachment_filenames: dict[str, str] | None = None,
 ) -> None:
     """
     Handle document tracking in the database (full-replace mode).
@@ -209,6 +215,10 @@ async def handle_document_tracking(
         is_first_batch: Whether this is the first batch (for chunked operations)
         retain_params: Optional parameters passed during retain (context, event_date, etc.)
         document_tags: Optional list of tags to associate with the document
+        attachment_filenames: Short id -> the name the caller gave that attachment in
+            this document. Recorded on the document edge rather than the blob, since
+            a filename describes the reference and the same bytes can carry a
+            different name in another document.
         ops: Backend-specific DataAccessOps. Required by the inner
             ``delete_stale_observations_for_memories`` call to choose the PG
             (native array) vs Oracle (junction table) read path. Defaults to
@@ -285,17 +295,15 @@ async def handle_document_tracking(
                 # cascade lands.
                 await enqueue_entity_prune_candidates(conn, bank_id, doomed_ids)
 
-        # Explicitly delete memory_units by document_id BEFORE deleting the
-        # document row. The CASCADE from documents→chunks→memory_units only
-        # catches units that have a non-NULL chunk_id FK. Units with chunk_id=NULL
-        # (e.g. from partial writes or edge cases) would survive the cascade.
-        # This explicit delete ensures complete cleanup.
-        await store.delete_document(conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id)
-        # Capture created_at before deletion so re-ingestion preserves it.
-        preserved_created_at = await conn.fetchval(
-            f"DELETE FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2 RETURNING created_at",
-            document_id,
-            bank_id,
+        # Then the outgoing facts, their links and the document row itself, keeping the row's
+        # created_at so re-ingestion preserves it.
+        preserved_created_at = await store.delete_document_for_replace(
+            conn=conn,
+            ops=ops,
+            fq_table=fq_table,
+            bank_id=bank_id,
+            document_id=document_id,
+            outgoing_unit_ids=existing_unit_ids,
         )
 
     # Insert document (or update if exists from concurrent operations)
@@ -309,6 +317,7 @@ async def handle_document_tracking(
         document_tags,
         preserved_created_at=preserved_created_at,
         store_document_text=store_document_text,
+        attachment_filenames=attachment_filenames,
     )
 
 
@@ -320,6 +329,7 @@ async def upsert_document_metadata(
     retain_params: dict | None = None,
     document_tags: list[str] | None = None,
     store_document_text: bool | None = None,
+    attachment_filenames: dict[str, str] | None = None,
 ) -> None:
     """
     Update document metadata without deleting existing facts/chunks.
@@ -341,6 +351,7 @@ async def upsert_document_metadata(
         retain_params,
         document_tags,
         store_document_text=store_document_text,
+        attachment_filenames=attachment_filenames,
     )
 
 
@@ -354,6 +365,7 @@ async def _upsert_document_row(
     document_tags: list[str] | None = None,
     preserved_created_at: datetime | None = None,
     store_document_text: bool | None = None,
+    attachment_filenames: dict[str, str] | None = None,
 ) -> None:
     """Insert or update a document row.
 
@@ -372,32 +384,79 @@ async def _upsert_document_row(
     # bank-configurable fields); the retain path always passes the resolved value.
     store_text = store_document_text if store_document_text is not None else _get_raw_config().store_document_text
     original_text = combined_content if store_text else None
-    # A store that owns a dedicated document store keeps the extracted text there, so the
-    # SQL documents row holds only its metadata (id, content_hash, tags) with original_text NULL —
-    # the bulky body is written to the store up front (orchestrator._store_document_bodies).
+    # A store that owns a dedicated document store keeps no SQL documents row: the body is written
+    # to the store up front (orchestrator._store_document_bodies), so this writes nothing there.
     from ..memories import get_memories
 
-    if get_memories().store_owned_for(bank_id):
-        original_text = None
-    await conn.execute(
-        f"""
-        INSERT INTO {fq_table("documents")} (id, bank_id, original_text, content_hash, retain_params, tags, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, NOW()), NOW())
-        ON CONFLICT (id, bank_id) DO UPDATE
-        SET original_text = EXCLUDED.original_text,
-            content_hash = EXCLUDED.content_hash,
-            retain_params = EXCLUDED.retain_params,
-            tags = EXCLUDED.tags,
-            updated_at = NOW()
-        """,
-        document_id,
-        bank_id,
-        original_text,
-        content_hash,
-        json.dumps(retain_params) if retain_params else None,
-        document_tags or [],
-        preserved_created_at,
+    await get_memories().upsert_document_row(
+        conn=conn,
+        fq_table=fq_table,
+        bank_id=bank_id,
+        document_id=document_id,
+        original_text=original_text,
+        content_hash=content_hash,
+        retain_params=retain_params,
+        document_tags=document_tags,
+        preserved_created_at=preserved_created_at,
     )
+    await sync_document_attachments(conn, bank_id, document_id, combined_content, attachment_filenames)
+
+
+async def sync_document_attachments(
+    conn,
+    bank_id: str,
+    document_id: str,
+    text: str,
+    filenames: dict[str, str] | None = None,
+) -> None:
+    """Drop the attachment rows this document's text no longer justifies.
+
+    Called on every document write, from the one place every write funnels
+    through. Which attachments a document carries is *derived* from its canonical
+    text, never supplied, so a re-ingest, an append or a delta re-extraction
+    cannot leave behind a row the text stopped referencing. That is why the retain
+    pipeline itself knows nothing about attachments: the rows are written at the
+    API ingress, where the bytes arrive, and this only ever takes them away.
+
+    The bytes are not deleted here. This runs inside the retain's transaction, and
+    a rollback would restore rows whose blobs are already gone; the caller
+    reclaims them afterwards (``_document_attachment_keys`` before the retain,
+    ``_reclaim_orphaned_attachments`` after it).
+
+    ``filenames`` maps short id to the name the caller gave that attachment in
+    this write. A write that restates a name applies it; one that does not (an
+    append, a delta re-extraction, a reprocess replaying stored text) leaves the
+    row's existing name alone rather than blanking it.
+    """
+    from .attachment_content import iter_placeholder_ids
+
+    referenced = sorted(set(iter_placeholder_ids(text or "")))
+    if referenced:
+        await conn.execute(
+            f"DELETE FROM {fq_table('attachments')} "
+            f"WHERE bank_id = $1 AND document_id = $2 AND NOT (short_id = ANY($3::text[]))",
+            bank_id,
+            document_id,
+            referenced,
+        )
+    else:
+        await conn.execute(
+            f"DELETE FROM {fq_table('attachments')} WHERE bank_id = $1 AND document_id = $2",
+            bank_id,
+            document_id,
+        )
+
+    restated = [
+        (bank_id, document_id, short_id, name)
+        for short_id, name in (filenames or {}).items()
+        if short_id in set(referenced) and name
+    ]
+    if restated:
+        await conn.executemany(
+            f"UPDATE {fq_table('attachments')} SET filename = $4 "
+            f"WHERE bank_id = $1 AND document_id = $2 AND short_id = $3",
+            restated,
+        )
 
 
 def _normalize_scopes(value: list | str | None) -> list | str | None:
@@ -425,6 +484,7 @@ async def update_memory_units_metadata_and_tags(
     metadata: dict[str, Any],
     *,
     observation_scopes: list | str | None = None,
+    label_tag_keys: set[str] | None = None,
     ops=None,
 ) -> int:
     """Update document-level attributes on existing memory units.
@@ -432,6 +492,22 @@ async def update_memory_units_metadata_and_tags(
     Delta retain preserves unchanged chunks and their facts. Propagate the
     current document tags, metadata and observation scoping so its optimized
     result matches a full replace.
+
+    ``tags`` is the DOCUMENT's tag set and replaces what a survivor carries of it
+    outright — the caller owns those, so a re-retain that drops one drops it here too.
+    But the column also holds *label tags*: the projection of the ``entity_labels``
+    groups flagged ``tag: true``, mirrored out of each unit's own entities at extraction
+    (``_inject_label_tags``). Those are derived per fact, not per document, and a unit
+    only acquires them by being extracted — so a survivor, which by definition was not
+    re-extracted, keeps the ones it has. ``label_tag_keys`` names the group keys that
+    projection claims; a ``key:value`` tag under one of them is carried forward rather
+    than overwritten (issue #4068).
+
+    Without that carry-forward the same document ended a delta retain holding units
+    labelled ``category:durable`` beside units that were not, differing only in whether
+    their chunk happened to change — and a tags filter returned an arbitrary slice of it.
+    Passing no ``label_tag_keys`` (or a bank with no such group) keeps the plain
+    overwrite, which is what a document with no label projection wants.
 
     ``metadata`` arrives as the raw retain_params bag (the document row keeps
     the caller's input verbatim), so null-valued keys are dropped here — the
@@ -455,93 +531,34 @@ async def update_memory_units_metadata_and_tags(
     Returns:
         Number of memory units updated.
     """
-    from ..memories import MemoryPatch, get_memories
-    from ..memories.base import META_METADATA_JSON, META_OBSERVATION_SCOPES
+    from ..memories import get_memories
+    from .entity_labels import split_label_tags
+
+    def _tags_for(existing: list[str] | None) -> list[str]:
+        """The document tags, plus the label projection this unit already carries."""
+        merged = list(tags or [])
+        seen = set(merged)
+        for t in split_label_tags(existing, label_tag_keys):
+            if t not in seen:
+                seen.add(t)
+                merged.append(t)
+        return merged
 
     store = get_memories()
-    if store.store_owned_for(bank_id):
-        # A store that keeps memories outside SQL: page the document's memories and patch each
-        # one's tags and metadata through the store — the UPDATE below is a no-op on its empty
-        # memory_units.
-        page = await store.scan_memories(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id, limit=1_000_000
-        )
-        # Metadata too, not just tags: the SQL branch below sets both, and a survivor left carrying
-        # the PREVIOUS retain's metadata is exactly what this function exists to prevent — measured
-        # on an append, older units still read {"source": "email"} after a retain carrying
-        # {"source": "crm"}.
-        #
-        # Written under META_METADATA_JSON as one JSON value, which is where the bag contract puts a
-        # memory's user metadata and what every read reconstructs it from. A flat {"source": "crm"}
-        # would merge a stray top-level key into the record's own bag instead: applied, reported as
-        # applied, and invisible to every reader. The bag's other keys are internal (context,
-        # chunk_id, consolidation_failed_at, …) and a patch that carried user keys loose among them
-        # could not be told apart from one setting an internal field.
-        #
-        # Set unconditionally, mirroring `SET metadata = $4`: a document whose metadata was cleared
-        # must clear on its survivors too, which an absent key would not do.
-        patches = [
-            MemoryPatch(
-                unit_id=m.unit_id,
-                tags=list(tags or []),
-                metadata={
-                    META_METADATA_JSON: json.dumps(drop_null_values(metadata or {})),
-                    META_OBSERVATION_SCOPES: json.dumps(observation_scopes),
-                },
-            )
-            for m in page.memories
-        ]
-        if patches:
-            await store.update_memories(bank_id, patches)
-        rescoped = [
-            m.unit_id
-            for m in page.memories
-            if m.fact_type in ("experience", "world")
-            and (
-                set(m.tags or []) != set(tags or [])
-                or _normalize_scopes(m.observation_scopes) != _normalize_scopes(observation_scopes)
-            )
-        ]
-        if rescoped:
-            await delete_stale_observations_for_memories(conn, bank_id, rescoped, ops=ops)
-            # The rescoped units survive, so `delete_stale_observations` (which requeues only
-            # an observation's OTHER sources, the ones not being deleted) does not reach them.
-            await store.mark_consolidated(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=rescoped, when=None)
-        return len(patches)
-
-    # Read the scoping the survivors carry BEFORE overwriting it — the cascade below has to
-    # know which units actually moved, and after the UPDATE that is no longer answerable.
-    prior = await conn.fetch(
-        f"""
-        SELECT id, fact_type, tags, observation_scopes
-        FROM {fq_table("memory_units")}
-        WHERE bank_id = $1 AND document_id = $2
-        """,
-        bank_id,
-        document_id,
+    # The survivors' tags, metadata and scoping, written by whichever store holds them. It
+    # reports which units actually moved (read BEFORE the overwrite), which is what the
+    # observation cascade below needs.
+    relabelled = await store.relabel_document_memories(
+        conn=conn,
+        fq_table=fq_table,
+        bank_id=bank_id,
+        document_id=document_id,
+        tags=tags,
+        metadata=metadata,
+        observation_scopes=observation_scopes,
+        final_tags=_tags_for,
     )
-    rescoped_ids = [
-        row["id"]
-        for row in prior
-        if row["fact_type"] in ("experience", "world")
-        and (
-            set(row["tags"] or []) != set(tags or [])
-            or _normalize_scopes(row["observation_scopes"]) != _normalize_scopes(observation_scopes)
-        )
-    ]
-
-    result = await conn.execute(
-        f"""
-        UPDATE {fq_table("memory_units")}
-        SET tags = $3, metadata = $4, observation_scopes = $5, updated_at = NOW()
-        WHERE bank_id = $1 AND document_id = $2
-        """,
-        bank_id,
-        document_id,
-        tags or [],
-        json.dumps(drop_null_values(metadata)),
-        json.dumps(observation_scopes) if observation_scopes is not None else None,
-    )
+    rescoped_ids = relabelled.rescoped_unit_ids
 
     if rescoped_ids:
         await delete_stale_observations_for_memories(conn, bank_id, rescoped_ids, ops=ops)
@@ -550,13 +567,7 @@ async def update_memory_units_metadata_and_tags(
         # the ones being deleted — skips them. Reset them here or they stay marked
         # consolidated against an observation that no longer exists and are never selected
         # into a batch again. Through the store's `mark_consolidated` rather than a raw
-        # UPDATE, the same call the store-owned branch and `update_document` make.
-        await store.mark_consolidated(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(uid) for uid in rescoped_ids], when=None
-        )
+        # UPDATE, the same call `update_document` makes.
+        await store.mark_consolidated(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=rescoped_ids, when=None)
 
-    # result is a status string like "UPDATE 5"
-    try:
-        return int(result.split()[-1])
-    except (ValueError, IndexError):
-        return 0
+    return relabelled.updated

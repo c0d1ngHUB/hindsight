@@ -15,6 +15,7 @@ from hindsight_api.engine.multi_llm import (
     _should_failover,
     _WeightedRoundRobin,
 )
+from hindsight_api.engine.response_models import LLMCallResult, TokenUsage
 
 
 class FakeMember:
@@ -35,7 +36,8 @@ class FakeMember:
 
     async def call(self, **kwargs):
         self.calls += 1
-        return self._resolve()
+        # `call` returns the envelope; `_resolve` yields the payload (or raises).
+        return LLMCallResult(content=self._resolve(), usage=TokenUsage())
 
     async def call_with_tools(self, **kwargs):
         self.calls += 1
@@ -73,7 +75,7 @@ def _round_robin(*members, weights=None):
 
 async def test_failover_uses_primary_on_success():
     a, b = FakeMember("a", "RA"), FakeMember("b", "RB")
-    result = await _failover(a, b).call(messages=[])
+    result = (await _failover(a, b).call(messages=[])).content
     assert result == "RA"
     assert (a.calls, b.calls) == (1, 0)  # secondary untouched
 
@@ -81,7 +83,7 @@ async def test_failover_uses_primary_on_success():
 async def test_failover_advances_only_after_member_raises():
     a = FakeMember("a", RuntimeError("primary down"))
     b = FakeMember("b", "RB")
-    result = await _failover(a, b).call(messages=[])
+    result = (await _failover(a, b).call(messages=[])).content
     assert result == "RB"
     assert (a.calls, b.calls) == (1, 1)
 
@@ -136,7 +138,7 @@ def test_should_failover_classification():
 async def test_round_robin_rotates_start_member():
     a, b, c = FakeMember("a", "RA"), FakeMember("b", "RB"), FakeMember("c", "RC")
     rr = _round_robin(a, b, c)
-    results = [await rr.call(messages=[]) for _ in range(3)]
+    results = [(await rr.call(messages=[])).content for _ in range(3)]
     # Smooth WRR with uniform weights visits every member once per cycle.
     assert sorted(results) == ["RA", "RB", "RC"]
     assert (a.calls, b.calls, c.calls) == (1, 1, 1)
@@ -148,7 +150,7 @@ async def test_round_robin_falls_over_when_selected_member_fails():
     # Two members, uniform weights: whichever is selected first, a failure must
     # still produce a successful result via the other member.
     rr = _round_robin(a, b)
-    result = await rr.call(messages=[])
+    result = (await rr.call(messages=[])).content
     assert result == "RB"
 
 
@@ -198,3 +200,60 @@ async def test_verify_connection_strict_primary_soft_secondary():
     b = FakeMember("b", RuntimeError("down"))
     await _failover(a, b).verify_connection()
     assert a.verified == 1 and b.verified == 1
+
+
+# ── prompt caching (#5123) ───────────────────────────────────────────────────
+
+
+def _caching_member(name: str, *, caches: bool, fails: bool = False):
+    """A real ``LLMProvider`` over a fake impl that records the cache handle it is called with."""
+    from hindsight_api.engine.llm_wrapper import LLMProvider
+
+    member = LLMProvider(provider="mock", api_key="", base_url="", model=name, max_retries=0)
+    impl = member._provider_impl
+    impl.seen_prefix = "unset"
+
+    async def get_or_create_cached_prefix(**kwargs):
+        return f"{name}-cache"
+
+    async def call(**kwargs):
+        impl.seen_prefix = kwargs.get("cached_prefix")
+        if fails:
+            raise RuntimeError(f"{name} down")
+        return LLMCallResult(content="ok", usage=TokenUsage())
+
+    impl.supports_prompt_caching = lambda: caches
+    impl.get_or_create_cached_prefix = get_or_create_cached_prefix
+    impl.call = call
+    return member, impl
+
+
+async def test_fallback_member_builds_its_own_prompt_cache():
+    """The member that serves the call caches its own prefix, not the primary's."""
+    from hindsight_api.engine.llm_interface import PromptCachePrefix
+
+    primary, primary_impl = _caching_member("codex", caches=False, fails=True)
+    gemini, gemini_impl = _caching_member("gemini", caches=True)
+
+    await _failover(primary, gemini).call(
+        messages=[{"role": "system", "content": "s"}],
+        prompt_cache=PromptCachePrefix(system_instruction="s"),
+    )
+
+    assert primary_impl.seen_prefix is None  # non-caching primary is never handed a handle
+    assert gemini_impl.seen_prefix == "gemini-cache"
+
+
+async def test_caching_primary_handle_never_reaches_fallback_member():
+    from hindsight_api.engine.llm_interface import PromptCachePrefix
+
+    primary, primary_impl = _caching_member("gemini", caches=True, fails=True)
+    other, other_impl = _caching_member("openai", caches=False)
+
+    await _failover(primary, other).call(
+        messages=[{"role": "system", "content": "s"}],
+        prompt_cache=PromptCachePrefix(system_instruction="s"),
+    )
+
+    assert primary_impl.seen_prefix == "gemini-cache"
+    assert other_impl.seen_prefix is None

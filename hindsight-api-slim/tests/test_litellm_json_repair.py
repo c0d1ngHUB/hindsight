@@ -52,14 +52,16 @@ async def test_malformed_json_repaired_after_retries_exhausted(monkeypatch):
 
     monkeypatch.setattr(provider, "_acompletion", _fake)
 
-    result = await provider.call(
-        messages=[{"role": "user", "content": "hi"}],
-        response_format=_Facts,
-        skip_validation=True,
-        max_retries=1,
-        initial_backoff=0.01,
-        max_backoff=0.01,
-    )
+    result = (
+        await provider.call(
+            messages=[{"role": "user", "content": "hi"}],
+            response_format=_Facts,
+            skip_validation=True,
+            max_retries=1,
+            initial_backoff=0.01,
+            max_backoff=0.01,
+        )
+    ).content
 
     # A clean re-roll is preferred first: attempt 0 raises, attempt 1 repairs.
     assert calls == 2
@@ -76,14 +78,16 @@ async def test_clean_reroll_preferred_over_repair(monkeypatch):
 
     monkeypatch.setattr(provider, "_acompletion", _fake)
 
-    result = await provider.call(
-        messages=[{"role": "user", "content": "hi"}],
-        response_format=_Facts,
-        skip_validation=True,
-        max_retries=1,
-        initial_backoff=0.01,
-        max_backoff=0.01,
-    )
+    result = (
+        await provider.call(
+            messages=[{"role": "user", "content": "hi"}],
+            response_format=_Facts,
+            skip_validation=True,
+            max_retries=1,
+            initial_backoff=0.01,
+            max_backoff=0.01,
+        )
+    ).content
 
     assert result == {"a": 2}  # the clean re-roll, not a repair of the first
 
@@ -113,3 +117,32 @@ async def test_unrecoverable_json_raises_after_retries(monkeypatch):
         )
 
     assert calls == 2
+
+
+async def test_fence_marker_inside_a_json_value_is_kept(monkeypatch):
+    """A ``` inside a string value must not cut the payload short (#4819)."""
+    provider = _make_provider()
+    calls = 0
+
+    async def _fake(**kwargs):
+        nonlocal calls
+        calls += 1
+        return _make_response('```json\n{"a": 1, "note": "wrap it in ```json fences"}\n```')
+
+    monkeypatch.setattr(provider, "_acompletion", _fake)
+
+    result = (
+        await provider.call(
+            messages=[{"role": "user", "content": "hi"}],
+            response_format=_Facts,
+            skip_validation=True,
+            max_retries=1,
+            initial_backoff=0.01,
+            max_backoff=0.01,
+        )
+    ).content
+
+    # Parsed on the first attempt. The old split cut the payload short, so the call
+    # only survived by burning a retry and falling through to json_repair.
+    assert calls == 1
+    assert result == {"a": 1, "note": "wrap it in ```json fences"}

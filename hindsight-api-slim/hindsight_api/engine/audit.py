@@ -6,7 +6,6 @@ Provides fire-and-forget audit logging of all mutating and core operations
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import uuid
@@ -16,13 +15,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+import orjson
 from pydantic import BaseModel, Field
 
 from ..engine.db_utils import acquire_with_retry
 from ..models import RequestContext
+from .background_writes import PendingWrites
 from .schema import fq_table_explicit
 
 logger = logging.getLogger(__name__)
+
+# How long close() waits for in-flight audit writes before giving up on them.
+_DRAIN_TIMEOUT_SECONDS = 5.0
 
 
 class AuditLogEntry(BaseModel):
@@ -82,6 +86,9 @@ class AuditEntry:
     ended_at: datetime | None = None
     request: dict[str, Any] | None = None
     response: dict[str, Any] | None = None
+    # The response already serialized, when the caller could do it in one step (a pydantic
+    # model's Rust ``model_dump_json``). Preferred over ``response`` by the writer.
+    response_json: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -103,7 +110,15 @@ def _safe_json(data: Any) -> str | None:
     if data is None:
         return None
     try:
-        return json.dumps(data, default=_json_default)
+        # A recall's audit row carries its whole response; stdlib json.dumps of it was ~3.5%
+        # of the API's busy CPU in a profile at 450 recalls/s. orjson emits the same JSON
+        # document (the column is JSON, so key order and escaping are not observable). It
+        # raises TypeError on what it cannot encode (e.g. ints wider than 64 bits), which the
+        # stdlib still handles, so that stays the fallback.
+        try:
+            return orjson.dumps(data, default=_json_default, option=orjson.OPT_NON_STR_KEYS).decode()
+        except TypeError:
+            return json.dumps(data, default=_json_default)
     except Exception:
         logger.debug("Failed to serialize audit data", exc_info=True)
         return None
@@ -131,6 +146,7 @@ class AuditLogger:
         # (env -> tenant -> bank). None means "no per-bank resolution wired",
         # in which case the global value alone decides.
         self._bank_enabled_resolver = bank_enabled_resolver
+        self._writes = PendingWrites("audit log write")
 
     def action_allowed(self, action: str) -> bool:
         """Global action-allowlist check. Cheap, synchronous, bank-independent.
@@ -176,11 +192,15 @@ class AuditLogger:
         """
         if not self.action_allowed(entry.action):
             return
-        try:
-            asyncio.create_task(self._safe_log(entry))
-        except RuntimeError:
-            # No running event loop (e.g. during shutdown)
-            logger.debug("Cannot schedule audit log write: no running event loop")
+        self._writes.schedule(self._safe_log(entry))
+
+    async def drain(self) -> None:
+        """Wait for audit writes already scheduled; call before the database pool is closed.
+
+        Bounded, so a stuck database cannot hang shutdown. Writes still running
+        at the deadline are abandoned and counted in a warning.
+        """
+        await self._writes.drain_all(_DRAIN_TIMEOUT_SECONDS)
 
     async def _safe_log(self, entry: AuditEntry) -> None:
         """Write audit entry to DB. Errors are logged, never raised."""
@@ -210,7 +230,7 @@ class AuditLogger:
                     entry.started_at,
                     entry.ended_at,
                     _safe_json(entry.request),
-                    _safe_json(entry.response),
+                    entry.response_json if entry.response_json is not None else _safe_json(entry.response),
                     _safe_json(entry.metadata) or "{}",
                 )
         except Exception as e:

@@ -13,6 +13,7 @@ were resolved into ``HindsightConfig`` but never reached the provider, so a conf
 (``LiteLLM call exceeded timeout=120.0s``) and the per-op retry knobs were inert.
 """
 
+from hindsight_api.engine.response_models import LLMCallResult, TokenUsage
 import pytest
 
 from hindsight_api.config import (
@@ -35,7 +36,7 @@ def _spy_provider_call(monkeypatch, llm: LLMConfig) -> dict:
 
     async def fake_call(**kwargs):
         captured.update(kwargs)
-        return "ok"
+        return LLMCallResult(content="ok", usage=TokenUsage())
 
     monkeypatch.setattr(llm._provider_impl, "call", fake_call)
     return captured
@@ -61,6 +62,7 @@ def test_openai_compatible_provider_impl_receives_timeout():
         ("anthropic", {}),
         ("gemini", {}),
         ("github-copilot", {}),
+        ("cursor", {}),
         ("llamacpp", {}),
     ],
 )
@@ -80,6 +82,8 @@ def test_every_network_provider_receives_the_resolved_timeout(provider, extra, m
     with (
         patch.object(CodexLLM, "_load_codex_auth", return_value=("token", "account")),
         patch.object(CodexLLM, "_load_codex_refresh_token", return_value=None),
+        # The cursor provider resolves its CLI at construction; CI has no cursor-agent.
+        patch("hindsight_api.engine.providers.cursor_llm.shutil.which", return_value="/usr/bin/cursor-agent"),
     ):
         llm = LLMConfig(provider=provider, api_key="k", base_url="", model="m", timeout=222.0, **extra)
     assert llm._provider_impl.timeout == 222.0

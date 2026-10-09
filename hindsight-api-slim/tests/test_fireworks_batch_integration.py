@@ -3,7 +3,7 @@
 This makes REAL calls to Fireworks' batch API and runs the full retain fact
 extraction pipeline end-to-end (submit -> poll -> download -> normalize ->
 parse facts). It is the only test that validates the one assumption the unit
-tests (which use mocked httpx responses) cannot: that Fireworks' real output
+tests (which use a stub control-plane server) cannot: that Fireworks' real output
 JSONL shape matches what ``_normalize_output_line`` produces and what
 ``fact_extraction`` consumes. If the shape is wrong, this returns zero facts.
 
@@ -103,7 +103,7 @@ async def test_real_fireworks_batch_end_to_end(fireworks_env):
     ]
 
     logger.info("Submitting a real Fireworks batch (this can take several minutes)...")
-    facts, chunks, usage = await extract_facts_from_contents_batch_api(
+    extraction = await extract_facts_from_contents_batch_api(
         contents=contents,
         llm_config=llm_config,
         config=config,
@@ -111,6 +111,9 @@ async def test_real_fireworks_batch_end_to_end(fireworks_env):
         operation_id=None,
         schema=None,
     )
+    facts = extraction.facts
+    chunks = extraction.chunks
+    usage = extraction.usage
 
     # The end-to-end proof: if the real output shape doesn't match the normalizer,
     # the consumer extracts nothing and this is empty.

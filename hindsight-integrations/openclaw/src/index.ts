@@ -2,14 +2,18 @@ import type {
   MoltbotPluginAPI,
   PluginConfig,
   PluginHookAgentContext,
-  PluginToolContext,
   MemoryResult,
   RetainRequest,
 } from "./types.js";
 import { HindsightServer, type Logger } from "@vectorize-io/hindsight-all";
-import { HindsightClient, type HindsightClientOptions } from "@vectorize-io/hindsight-client";
+import {
+  HindsightClient,
+  type HindsightClientOptions,
+  type MinScores,
+} from "@vectorize-io/hindsight-client";
 import { RetainQueue } from "./retain-queue.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
+import { parseSessionFile } from "./session-file.js";
 import { createHash, randomUUID } from "crypto";
 import { dirname, join } from "path";
 import * as log from "./logger.js";
@@ -17,7 +21,6 @@ import { configureLogger, setApiLogger, stopLogger } from "./logger.js";
 import { mkdirSync } from "fs";
 import { createRequire } from "module";
 import { homedir } from "os";
-import { createKnowledgeTools, TOOL_NAMES } from "@vectorize-io/hindsight-agent-sdk";
 import {
   applyConfiguredBankDefaults,
   hasConfiguredBankDefaults,
@@ -102,6 +105,9 @@ const MIN_VERSION_FOR_ASYNC_RETAIN_OPERATION_ID = "0.8.6";
 let currentPluginConfig: PluginConfig | null = null;
 let serviceGeneration = 0;
 let serviceAbortController: AbortController | null = null;
+// External-API hooks can lazy-initialize before the first service.start(). Keep
+// that recall-only lifetime cancellable without enabling pre-start retention.
+const preServiceRecallController = new AbortController();
 
 // Track which banks have had configured defaults applied (missions + bank config).
 const banksWithDefaultsApplied = new Set<string>();
@@ -129,8 +135,10 @@ export interface BankScopedClient {
       budget?: "low" | "mid" | "high";
       types?: Array<"world" | "experience" | "observation">;
       preferObservations?: boolean;
+      minScores?: MinScores;
     },
-    timeoutMs?: number
+    timeoutMs?: number,
+    signal?: globalThis.AbortSignal
   ): Promise<RecallResponse>;
   setMissions(opts: BankMissionsUpdate): Promise<void>;
 }
@@ -156,27 +164,53 @@ export function scopeClient(c: HindsightClient, bankId: string): BankScopedClien
         ...(capability === "supported" && req.operationId ? { operationId: req.operationId } : {}),
       });
     },
-    async recall(req, timeoutMs) {
-      const call = c.recall(bankId, req.query, {
-        maxTokens: req.maxTokens,
-        budget: req.budget,
-        types: req.types,
-        preferObservations: req.preferObservations,
+    async recall(req, timeoutMs, signal) {
+      signal?.throwIfAborted();
+      // Two independent reasons to stop: the caller's service-owned signal (stop
+      // or restart) and this call's own deadline. Compose them so the transport is
+      // cancelled by whichever fires first, while the reason the caller classifies
+      // on survives — a TimeoutError for the deadline, an AbortError for a stop.
+      const deadline = new AbortController();
+      const effective = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
+      let onAbort!: () => void;
+      const cancelled = new Promise<never>((_, reject) => {
+        onAbort = () => reject(effective.reason);
+        effective.addEventListener("abort", onAbort, { once: true });
       });
-      if (!timeoutMs) return call;
-      // The generated client doesn't accept a per-call AbortSignal, so we race
-      // against a TimeoutError here. The before_prompt_build caller already
-      // special-cases `DOMException { name: 'TimeoutError' }` from the old
-      // bespoke client, so we preserve that contract.
-      return Promise.race([
-        call,
-        new Promise<never>((_, reject) =>
-          setTimeout(
-            () => reject(new DOMException(`Recall timed out after ${timeoutMs}ms`, "TimeoutError")),
+      const timer = timeoutMs
+        ? setTimeout(
+            () =>
+              deadline.abort(
+                new DOMException(`Recall timed out after ${timeoutMs}ms`, "TimeoutError")
+              ),
             timeoutMs
           )
-        ),
-      ]);
+        : undefined;
+      try {
+        // A race alone only stopped the hook's wait. Forward cancellation to the
+        // client too, so its HTTP request receives the deadline and service stops.
+        //
+        // The race stays as a backstop for a transport that ignores the signal,
+        // which is not hypothetical: from client 0.10.x recall routes through
+        // `retryOnCapacity`, whose backoff sleeps in a plain setTimeout, so an
+        // abort during a 429/503 wait does not interrupt it. (#4445)
+        const response = await Promise.race([
+          c.recall(bankId, req.query, {
+            maxTokens: req.maxTokens,
+            budget: req.budget,
+            types: req.types,
+            preferObservations: req.preferObservations,
+            minScores: req.minScores,
+            signal: effective,
+          }),
+          cancelled,
+        ]);
+        effective.throwIfAborted();
+        return response;
+      } finally {
+        clearTimeout(timer);
+        effective.removeEventListener("abort", onAbort);
+      }
     },
     async setMissions(opts) {
       // createBank upserts each mission column the request explicitly sets;
@@ -441,6 +475,42 @@ export async function flushRetainQueue(
 const DEFAULT_RECALL_PROMPT_PREAMBLE =
   "Relevant memories from past conversations (prioritize recent when conflicting). Only use memories that are directly useful to continue this conversation; ignore the rest:";
 
+/**
+ * The messages a retain should work from, for a `session_end` event that carries none.
+ *
+ * OpenClaw's `buildSessionEndHookPayload()` sends `sessionId`, `sessionKey`,
+ * `messageCount`, `durationMs`, `reason`, `sessionFile` and the next session's ids -
+ * no `messages` array, and a `context` holding only ids. The forced flush added for
+ * #1726 therefore ended at its own "no messages" guard on every session close, and the
+ * turns after the last cadence boundary were never retained (#4341).
+ *
+ * The transcript the event points at is the source: one synchronous read, which is what
+ * the shutdown drain's shared 2s budget allows, and extraction still happens
+ * asynchronously in the bank's operation queue. `undefined` when there is no readable
+ * transcript, which leaves the caller's existing guard to skip the flush as before.
+ *
+ * `/new` matters here: OpenClaw emits the previous session's `session_end` lazily, on
+ * the first turn of its successor, so the old messages are gone from the live session
+ * entry by then and the file is the only copy.
+ */
+export function sessionEndMessagesFromTranscript(
+  event: unknown,
+  read: typeof parseSessionFile = parseSessionFile
+): unknown[] | undefined {
+  const payload = (event ?? {}) as Record<string, any>;
+  const sessionFile = typeof payload.sessionFile === "string" ? payload.sessionFile : undefined;
+  if (!sessionFile) return undefined;
+  const agentId = typeof payload.context?.agentId === "string" ? payload.context.agentId : "";
+  try {
+    const messages = read(sessionFile, agentId).messages;
+    return messages.length > 0 ? messages : undefined;
+  } catch {
+    // A missing, truncated or unreadable transcript is not an error worth failing the
+    // session close over; the caller skips the flush exactly as it did before.
+    return undefined;
+  }
+}
+
 export function formatCurrentTimeForRecall(date = new Date()): string {
   const year = date.getUTCFullYear();
   const month = String(date.getUTCMonth() + 1).padStart(2, "0");
@@ -554,7 +624,10 @@ if (typeof global !== "undefined") {
     ): Promise<BankScopedClient | null> => {
       if (!client) return null;
       const config = currentPluginConfig || {};
-      const bankId = usesStaticBank(config) ? getStaticBankId(config) : deriveBankId(ctx, config);
+      // deriveBankId already returns the static bank when dynamicBankId is false,
+      // so the branch that used to stand here was redundant — and it routed around
+      // the agentBankMap lookup for static configs. (#3890)
+      const bankId = deriveBankId(ctx, config);
       const scoped = scopeClient(client, bankId);
 
       // Stamp configured defaults onto this bank on first use (recall or retain).
@@ -594,6 +667,73 @@ function getConfiguredBankId(pluginConfig: PluginConfig): string | undefined {
 
 function usesStaticBank(pluginConfig: PluginConfig): boolean {
   return pluginConfig.dynamicBankId === false;
+}
+
+/**
+ * Normalise the optional `agentBankMap` (agentId -> bankId).
+ *
+ * The value comes from user-edited config, so an entry whose bank is not a
+ * non-empty string is dropped rather than trusted — an empty one would otherwise
+ * route that agent to a bank literally named "". A map left with no usable entry
+ * is treated as unset. (#3890)
+ */
+export function normalizeAgentBankMap(input: unknown): Record<string, string> | undefined {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+
+  const normalized: Record<string, string> = {};
+  const dropped: string[] = [];
+  for (const [agentId, bankId] of Object.entries(input as Record<string, unknown>)) {
+    const trimmedAgentId = agentId.trim();
+    const trimmedBank = typeof bankId === "string" ? bankId.trim() : "";
+    if (!trimmedAgentId || !trimmedBank) {
+      dropped.push(agentId);
+      continue;
+    }
+    // Key on the trimmed id. Storing the raw key would keep an entry that can
+    // never match a resolved agent id — inert rather than wrong, and silent.
+    normalized[trimmedAgentId] = trimmedBank;
+  }
+
+  // Silently dropped config keys have bitten this plugin before (#1443), so say so.
+  if (dropped.length > 0) {
+    log.warn(
+      `agentBankMap: ignoring ${dropped.length} entr${dropped.length === 1 ? "y" : "ies"} with a missing or blank bank id (${dropped.join(", ")})`
+    );
+  }
+
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+/**
+ * The bank an agent is explicitly mapped to, if any.
+ *
+ * `agentBankMap` exists so one gateway can mix topologies: several agents share a
+ * named bank while the rest keep their derived per-agent/channel/user banks
+ * (#3890). The mapped name is used exactly as configured — `bankIdPrefix` is
+ * deliberately not applied, because the operator named this bank themselves.
+ */
+function mappedBankIdForAgent(
+  ctx: PluginHookAgentContext | undefined,
+  pluginConfig: PluginConfig
+): string | undefined {
+  const map = pluginConfig.agentBankMap;
+  if (!map || !ctx) return undefined;
+
+  const resolvedCtx = resolveSessionIdentity(ctx);
+  const agentId =
+    resolvedCtx?.agentId ||
+    (resolvedCtx?.sessionKey ? parseSessionKey(resolvedCtx.sessionKey).agentId : undefined);
+  // Object.hasOwn, not a plain lookup: an agent literally called "toString" or
+  // "constructor" would otherwise inherit a function from the prototype, which is
+  // truthy and is not a bank id.
+  if (!agentId || !Object.hasOwn(map, agentId)) return undefined;
+
+  // Re-check the value instead of trusting the caller to have normalised it: the
+  // backfill CLI builds its PluginConfig straight from openclaw.json and never
+  // passes through normalizeAgentBankMap, so it would otherwise back-fill into a
+  // differently-trimmed bank than the live gateway writes to.
+  const mapped = map[agentId];
+  return typeof mapped === "string" && mapped.trim().length > 0 ? mapped.trim() : undefined;
 }
 
 function getDefaultBankId(pluginConfig: PluginConfig): string {
@@ -671,22 +811,95 @@ export function stripInlineTimestampPrefix(content: string): string {
 }
 
 /**
+ * Provenance marker OpenClaw appends to every injected inbound context header
+ * since 2026.8.1 — e.g. `Conversation info: ⟦openclaw:ctx⟧`. Older hosts label
+ * the same blocks `Conversation info (untrusted metadata):` instead. Both forms
+ * are recognised: the plugin has to keep working against hosts on either side
+ * of that change.
+ */
+const INBOUND_CONTEXT_MARKER = "⟦openclaw:ctx⟧";
+
+/** Matches a header line in either the marker (2026.8.1+) or legacy form. */
+const INBOUND_META_HEADER_RE = new RegExp(
+  `^[^\\n]*(?:${INBOUND_CONTEXT_MARKER}|\\(untrusted metadata\\))[^\\n]*$`
+);
+
+/** True when `line` opens an OpenClaw-injected inbound metadata block. */
+function isInboundMetaHeaderLine(line: string): boolean {
+  return INBOUND_META_HEADER_RE.test(line.trim());
+}
+
+interface InboundMetaBlock {
+  /** Index of the header line's first character. */
+  start: number;
+  /** Index just past the block (header + body), i.e. where normal text resumes. */
+  end: number;
+  /** Parsed body when the block is a ```json fence, otherwise undefined. */
+  json?: unknown;
+}
+
+/**
+ * Locate every OpenClaw-injected inbound metadata block in `text`.
+ *
+ * Mirrors the host's own stripper: a header line is followed either by a
+ * ```json fence (block ends at the closing fence) or by free-form lines that
+ * end at the first blank line. Keying on the header rather than on a fenced
+ * payload is what makes marker-form blocks like `Chat history since last
+ * reply: ⟦openclaw:ctx⟧` strippable too.
+ */
+function findInboundMetaBlocks(text: string): InboundMetaBlock[] {
+  if (!text) return [];
+  const lines = text.split("\n");
+  // Byte offset of the start of each line, plus a terminator past the end.
+  const offsets: number[] = [];
+  let cursor = 0;
+  for (const line of lines) {
+    offsets.push(cursor);
+    cursor += line.length + 1;
+  }
+  offsets.push(cursor);
+
+  const blocks: InboundMetaBlock[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!isInboundMetaHeaderLine(lines[i])) continue;
+    const start = offsets[i];
+    let end: number;
+    let json: unknown;
+    if (lines[i + 1]?.trim() === "```json") {
+      let close = i + 2;
+      while (close < lines.length && lines[close].trim() !== "```") close++;
+      if (close < lines.length) {
+        try {
+          json = JSON.parse(lines.slice(i + 2, close).join("\n"));
+        } catch {
+          // Leave `json` undefined; the block is still stripped.
+        }
+      }
+      end = offsets[Math.min(close + 1, lines.length)];
+      i = close;
+    } else {
+      let blank = i + 1;
+      while (blank < lines.length && lines[blank].trim() !== "") blank++;
+      end = offsets[Math.min(blank + 1, lines.length)];
+      i = blank;
+    }
+    blocks.push({ start, end, json });
+  }
+  return blocks;
+}
+
+/**
  * Extract sender_id from OpenClaw's injected inbound metadata blocks.
- * Checks both "Conversation info (untrusted metadata)" and "Sender (untrusted metadata)" blocks.
+ * Reads both "Conversation info" and "Sender" blocks, in either the 2026.8.1+
+ * `⟦openclaw:ctx⟧` marker form or the legacy "(untrusted metadata)" form.
  * Returns the first sender_id / id string found, or undefined if none.
  */
 export function extractSenderIdFromText(text: string): string | undefined {
   if (!text) return undefined;
-  const metaBlockRe = /[\w\s]+\(untrusted metadata\)[^\n]*\n```json\n([\s\S]*?)\n```/gi;
-  let match: RegExpExecArray | null;
-  while ((match = metaBlockRe.exec(text)) !== null) {
-    try {
-      const obj = JSON.parse(match[1]);
-      const id = obj?.sender_id ?? obj?.id;
-      if (id && typeof id === "string") return id;
-    } catch {
-      // continue to next block
-    }
+  for (const block of findInboundMetaBlocks(text)) {
+    const obj = block.json as { sender_id?: unknown; id?: unknown } | undefined;
+    const id = obj?.sender_id ?? obj?.id;
+    if (typeof id === "string" && id) return id;
   }
   return undefined;
 }
@@ -696,12 +909,20 @@ export function extractSenderIdFromText(text: string): string | undefined {
  * These blocks are injected by OpenClaw but are noise for memory storage and recall.
  */
 export function stripMetadataEnvelopes(content: string): string {
-  // Strip: ---\n<Label> (untrusted metadata):\n```json\n{...}\n```\n<message>\n---
-  content = content
-    .replace(/^---\n[\w\s]+\(untrusted metadata\)[^\n]*\n```json[\s\S]*?```\n\n?/im, "")
-    .replace(/\n---$/, "");
-  // Strip: <Label> (untrusted metadata):\n```json\n{...}\n```  (without --- wrapper)
-  content = content.replace(/[\w\s]+\(untrusted metadata\)[^\n]*\n```json[\s\S]*?```\n?/gim, "");
+  if (!content) return content;
+  const blocks = findInboundMetaBlocks(content);
+  if (blocks.length > 0) {
+    const parts: string[] = [];
+    let cursor = 0;
+    for (const block of blocks) {
+      parts.push(content.slice(cursor, Math.max(cursor, block.start)));
+      cursor = Math.max(cursor, block.end);
+    }
+    parts.push(content.slice(cursor));
+    content = parts.join("");
+  }
+  // Drop the `---` fences that wrapped the legacy envelope form.
+  content = content.replace(/^---\n/, "").replace(/\n---$/, "");
   return stripRuntimeEnvelope(content).trim();
 }
 
@@ -778,7 +999,10 @@ export function extractRecallQuery(
     /^\s*\(untrusted metadata\)/i,
     /^\s*system:/i,
   ];
-  const isMetadata = (s: string) => METADATA_PATTERNS.some((p) => p.test(s));
+  const isMetadata = (s: string) =>
+    METADATA_PATTERNS.some((p) => p.test(s)) ||
+    // 2026.8.1+ marker form: a leftover header line is metadata, not a query.
+    isInboundMetaHeaderLine(s.split("\n")[0] ?? "");
 
   let recallQuery = rawMessage;
   // Strip sender metadata envelope before any checks
@@ -985,6 +1209,14 @@ export function parseSessionKey(sessionKey: string): ParsedSessionKey {
       channel: "main",
     };
   }
+  // OpenClaw's Control UI creates `agent:<id>:dashboard:<opaque-id>` keys.
+  // Recover only the agent identity: "dashboard" is a session namespace, not
+  // the live message provider used for dynamic bank routing.
+  if (parts.length === 4 && parts[2] === "dashboard") {
+    return {
+      agentId: parts[1],
+    };
+  }
   if (parts.length >= 4 && ["cron", "heartbeat", "subagent"].includes(parts[2])) {
     return {
       agentId: parts[1],
@@ -1148,13 +1380,20 @@ export function resolveAndCacheIdentity(options: ResolveAndCacheIdentityOptions)
     options.pluginConfig?.dynamicBankId === false &&
     typeof options.pluginConfig?.bankId === "string" &&
     options.pluginConfig.bankId.length > 0;
+  // A mapped agent is pinned the same way a static bank is: its bank comes from
+  // the map, not from the dispatch surface, so a surface mismatch cannot route
+  // the turn into the wrong bank and must not skip it. (#3890)
+  const mappedBanking =
+    options.pluginConfig !== undefined &&
+    mappedBankIdForAgent(resolvedCtx ?? effectiveCtx, options.pluginConfig) !== undefined;
 
   if (
     sessionProvider &&
     options.dispatchChannel &&
     sessionProvider !== options.dispatchChannel &&
     bankRoutingDependsOnSurface &&
-    !staticBanking
+    !staticBanking &&
+    !mappedBanking
   ) {
     const skipReason = finalSkipReason(
       `dispatch surface ${options.dispatchChannel} does not match session provider ${sessionProvider}`
@@ -1165,9 +1404,11 @@ export function resolveAndCacheIdentity(options: ResolveAndCacheIdentityOptions)
     return { effectiveCtx, resolvedCtx, skipReason };
   }
 
-  cacheSessionIdentity(sessionKey, resolvedCtx);
-
-  const { reason: skipReason } = getIdentitySkipReason(resolvedCtx, options.pluginConfig);
+  const { resolvedCtx: identityCtx, reason: skipReason } = getIdentitySkipReason(
+    resolvedCtx,
+    options.pluginConfig
+  );
+  cacheSessionIdentity(sessionKey, identityCtx);
   if (sessionKey) {
     if (skipReason) {
       setCappedMapValue(skipHindsightTurnBySession, sessionKey, skipReason);
@@ -1176,7 +1417,7 @@ export function resolveAndCacheIdentity(options: ResolveAndCacheIdentityOptions)
     }
   }
 
-  return { effectiveCtx, resolvedCtx, skipReason };
+  return { effectiveCtx, resolvedCtx: identityCtx, skipReason };
 }
 
 export function getIdentitySkipReason(
@@ -1200,7 +1441,11 @@ export function getIdentitySkipReason(
     pluginConfig?.dynamicBankId === false &&
     typeof pluginConfig?.bankId === "string" &&
     pluginConfig.bankId.length > 0;
-  const allowCliSessions = agentBanking || staticBanking;
+  //   - the agent has an explicit agentBankMap entry → the operator named that
+  //     bank for this agent, so its sessions belong there too (#3890)
+  const mappedBanking =
+    pluginConfig !== undefined && mappedBankIdForAgent(resolvedCtx, pluginConfig) !== undefined;
+  const allowCliSessions = agentBanking || staticBanking || mappedBanking;
 
   if (typeof sessionKey === "string") {
     if (/^agent:[^:]+:(cron|heartbeat|subagent):/.test(sessionKey)) {
@@ -1287,6 +1532,15 @@ export function deriveBankId(
   ctx: PluginHookAgentContext | undefined,
   pluginConfig: PluginConfig
 ): string {
+  // An explicit agent -> bank mapping wins over both the static bank and dynamic
+  // derivation, so a gateway can give one group of agents a shared bank while the
+  // rest keep derived ones (#3890). Resolved only when a map is configured, so the
+  // common path is untouched.
+  const mappedBankId = mappedBankIdForAgent(ctx, pluginConfig);
+  if (mappedBankId) {
+    return mappedBankId;
+  }
+
   if (pluginConfig.dynamicBankId === false) {
     return getStaticBankId(pluginConfig);
   }
@@ -1339,84 +1593,6 @@ export function deriveBankId(
   return pluginConfig.bankIdPrefix ? `${pluginConfig.bankIdPrefix}-${baseBankId}` : baseBankId;
 }
 
-function usesUserScopedBanking(pluginConfig: PluginConfig): boolean {
-  if (usesStaticBank(pluginConfig)) {
-    return false;
-  }
-  const granularity = pluginConfig.dynamicBankGranularity?.length
-    ? pluginConfig.dynamicBankGranularity
-    : DEFAULT_DYNAMIC_BANK_GRANULARITY;
-  return granularity.includes("user");
-}
-
-export interface KnowledgeToolBankResolution {
-  bankId: string;
-  resolvedCtx: PluginHookAgentContext | undefined;
-  identityError?: string;
-}
-
-/**
- * Resolve the Hindsight bank for knowledge tools using the same identity path as
- * auto-recall/retain. When user-scoped dynamic banking is enabled, unresolved
- * identity must not silently route to the shared default or anonymous bank.
- */
-export function resolveBankIdForKnowledgeTools(
-  toolCtx: PluginToolContext,
-  pluginConfig: PluginConfig
-): KnowledgeToolBankResolution {
-  if (usesStaticBank(pluginConfig)) {
-    return { bankId: getStaticBankId(pluginConfig), resolvedCtx: undefined };
-  }
-
-  const hookCtx: PluginHookAgentContext = {
-    agentId: toolCtx.agentId,
-    sessionKey: toolCtx.sessionKey,
-    workspaceDir: toolCtx.workspaceDir,
-  };
-
-  const { resolvedCtx, skipReason } = resolveAndCacheIdentity({
-    sessionKey: toolCtx.sessionKey,
-    ctx: hookCtx,
-    pluginConfig,
-  });
-  const { reason: identityReason } = getIdentitySkipReason(resolvedCtx, pluginConfig);
-  const effectiveSkip = skipReason ?? identityReason;
-  const bankId = deriveBankId(resolvedCtx, pluginConfig);
-
-  if (usesUserScopedBanking(pluginConfig)) {
-    const userSegment = resolvedCtx?.senderId || "anonymous";
-    if (effectiveSkip) {
-      return {
-        bankId,
-        resolvedCtx,
-        identityError:
-          `Hindsight knowledge tools skipped: ${formatIdentitySkipReason(effectiveSkip)}. ` +
-          "Knowledge tools use the same per-user memory bank as auto-recall/retain.",
-      };
-    }
-    if (userSegment === "anonymous") {
-      return {
-        bankId,
-        resolvedCtx,
-        identityError:
-          "Hindsight knowledge tools skipped: missing stable sender identity. " +
-          "Knowledge tools use the same per-user memory bank as auto-recall/retain.",
-      };
-    }
-    if (bankId === getDefaultBankId(pluginConfig)) {
-      return {
-        bankId,
-        resolvedCtx,
-        identityError:
-          "Hindsight knowledge tools skipped: could not resolve per-user memory bank. " +
-          "Knowledge tools use the same per-user memory bank as auto-recall/retain.",
-      };
-    }
-  }
-
-  return { bankId, resolvedCtx };
-}
-
 /**
  * Render the event window a memory carries. `mentioned_at` says when the fact
  * was stated; `occurred_start`/`occurred_end` say when the event itself
@@ -1454,6 +1630,7 @@ const NO_KEY_REQUIRED_PROVIDERS = new Set([
   "ollama",
   "openai-codex",
   "claude-code",
+  "cursor",
   "github-copilot",
 ]);
 
@@ -1881,6 +2058,7 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
         ? config.bankId.trim()
         : undefined,
     bankIdPrefix: config.bankIdPrefix,
+    agentBankMap: normalizeAgentBankMap(config.agentBankMap),
     retainTags: normalizeRetainTags(config.retainTags),
     retainSource:
       typeof config.retainSource === "string" && config.retainSource.trim().length > 0
@@ -1912,6 +2090,7 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
     recallMaxTokens: config.recallMaxTokens || 1024,
     recallTypes: Array.isArray(config.recallTypes) ? config.recallTypes : ["observation"],
     preferObservations: config.preferObservations === true, // Default: false — backward compatible
+    recallMinScores: config.recallMinScores,
     recallRoles: Array.isArray(config.recallRoles) ? config.recallRoles : ["user", "assistant"],
     retainEveryNTurns:
       typeof config.retainEveryNTurns === "number" && config.retainEveryNTurns >= 1
@@ -1965,7 +2144,6 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
       typeof config.retainQueueFlushIntervalMs === "number" && config.retainQueueFlushIntervalMs > 0
         ? config.retainQueueFlushIntervalMs
         : undefined,
-    enableKnowledgeTools: config.enableKnowledgeTools === true,
     senderPrefixPattern,
   };
 }
@@ -2012,7 +2190,9 @@ export default function (api: MoltbotPluginAPI) {
     api.registerService({
       id: "hindsight-memory",
       async start() {
+        preServiceRecallController.abort();
         serviceAbortController?.abort();
+        inflightRecalls.clear();
         const serviceController = new AbortController();
         serviceAbortController = serviceController;
         const startGeneration = ++serviceGeneration;
@@ -2292,8 +2472,10 @@ export default function (api: MoltbotPluginAPI) {
       async stop() {
         try {
           serviceGeneration++;
+          preServiceRecallController.abort();
           serviceAbortController?.abort();
           serviceAbortController = null;
+          inflightRecalls.clear();
           debug("[Hindsight] Service stopping...");
 
           // Only stop daemon if in local mode
@@ -2402,6 +2584,15 @@ export default function (api: MoltbotPluginAPI) {
     // Auto-recall: Inject relevant memories before agent processes the message
     // Hook signature: (event, ctx) where event has {prompt, messages?} and ctx has agent context
     api.on("before_prompt_build", async (event: any, ctx?: PluginHookAgentContext) => {
+      const recallGeneration = serviceGeneration;
+      const recallController =
+        serviceAbortController ?? (recallGeneration === 0 ? preServiceRecallController : null);
+      const isCurrentRecall = () =>
+        recallController !== null &&
+        (serviceAbortController ?? preServiceRecallController) === recallController &&
+        recallGeneration === serviceGeneration &&
+        !recallController.signal.aborted;
+      if (!isCurrentRecall()) return;
       // Optional perf instrumentation (#1406). Captured here at hook entry so
       // the early-return paths below don't influence the measurement of slow
       // recall calls — perf lines are only emitted on the recall path.
@@ -2533,9 +2724,11 @@ export default function (api: MoltbotPluginAPI) {
         }
 
         await clientGlobal.waitForReady();
+        if (!isCurrentRecall()) return;
 
         // Get client configured for this context's bank (async to handle mission setup)
         const client = await clientGlobal.getClientForContext(resolvedCtxForRecall);
+        if (!isCurrentRecall()) return;
         if (!client) {
           debug("[Hindsight] Client not initialized, skipping auto-recall");
           return;
@@ -2561,15 +2754,24 @@ export default function (api: MoltbotPluginAPI) {
               budget: pluginConfig.recallBudget,
               types: pluginConfig.recallTypes,
               preferObservations: pluginConfig.preferObservations,
+              minScores: pluginConfig.recallMinScores,
             },
-            recallTimeoutMs
+            recallTimeoutMs,
+            recallController?.signal
           );
           inflightRecalls.set(recallKey, recallPromise);
-          void recallPromise.catch(() => {}).finally(() => inflightRecalls.delete(recallKey));
+          void recallPromise
+            .catch(() => {})
+            .finally(() => {
+              // An old generation can settle after start() installed a successor.
+              if (inflightRecalls.get(recallKey) === recallPromise)
+                inflightRecalls.delete(recallKey);
+            });
         }
 
         const recallStart = pluginConfig.debugPerfTiming ? Date.now() : 0;
         const response = await recallPromise;
+        if (!isCurrentRecall()) return;
         const recallElapsedMs = pluginConfig.debugPerfTiming ? Date.now() - recallStart : 0;
 
         if (!response.results || response.results.length === 0) {
@@ -2642,9 +2844,18 @@ ${memoriesFormatted}
             `[Hindsight] Auto-recall timed out after ${pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS}ms, skipping memory injection`
           );
         } else if (error instanceof Error && error.name === "AbortError") {
-          log.warn(
-            `[Hindsight] Auto-recall aborted after ${pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS}ms, skipping memory injection`
-          );
+          // An AbortError now has two sources. The deadline is handled above as a
+          // TimeoutError; this branch is reached when the service was stopped or
+          // restarted mid-recall, which is not a timeout — quoting recallTimeoutMs
+          // there reports a deadline that never elapsed, with a number unrelated
+          // to the time actually spent. (#4450)
+          if (recallController?.signal.aborted) {
+            debug("[Hindsight] Auto-recall cancelled: service stopped, skipping memory injection");
+          } else {
+            log.warn(
+              `[Hindsight] Auto-recall aborted after ${pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS}ms, skipping memory injection`
+            );
+          }
         } else {
           log.error("auto-recall error", error);
         }
@@ -2774,10 +2985,20 @@ ${memoriesFormatted}
           return;
         }
 
-        if (
-          !Array.isArray(event.context?.sessionEntry?.messages ?? event.messages) ||
-          (event.context?.sessionEntry?.messages ?? event.messages ?? []).length === 0
-        ) {
+        // Resolved once: `session_end` carries no transcript, so the forced flush
+        // reads it from the file the event points at (#4341). Without this the guard
+        // below ended every session-close flush before it began.
+        let eventMessages = event.context?.sessionEntry?.messages ?? event.messages;
+        if (force && (!Array.isArray(eventMessages) || eventMessages.length === 0)) {
+          eventMessages = sessionEndMessagesFromTranscript(event);
+          if (Array.isArray(eventMessages)) {
+            debug(
+              `[Hindsight Hook] session_end: read ${eventMessages.length} messages from ${event.sessionFile}`
+            );
+          }
+        }
+
+        if (!Array.isArray(eventMessages) || eventMessages.length === 0) {
           debug("[Hindsight Hook] No messages in event, skipping retention");
           return;
         }
@@ -2789,7 +3010,7 @@ ${memoriesFormatted}
 
         // Chunked retention: skip non-Nth turns and use a sliding window when firing
         const retainEveryN = pluginConfig.retainEveryNTurns ?? 1;
-        const allMessages = event.context?.sessionEntry?.messages ?? event.messages ?? [];
+        const allMessages = eventMessages;
         let messagesToRetain = allMessages;
         let retainFullWindow = false;
 
@@ -3010,54 +3231,6 @@ ${memoriesFormatted}
     });
     debug("[Hindsight] Hooks registered");
     log.info("agent hooks registered");
-
-    // Register knowledge tools (opt-in via enableKnowledgeTools config flag)
-    if (pluginConfig.enableKnowledgeTools && typeof api.registerTool === "function") {
-      try {
-        const apiUrl = (() => {
-          const ext = detectExternalApi(pluginConfig);
-          return ext?.apiUrl || `http://localhost:${pluginConfig.apiPort || 9077}`;
-        })();
-        const apiToken = pluginConfig.hindsightApiToken || undefined;
-
-        // Factory: called per session with agent context, returns tools scoped to that bank.
-        // Identity is resolved the same way as auto-recall/retain so PluginToolContext
-        // (which lacks senderId/messageProvider) still routes to the per-user bank.
-        const factory = (ctx: PluginToolContext) => {
-          const resolution = resolveBankIdForKnowledgeTools(ctx, pluginConfig);
-          const tools = createKnowledgeTools({
-            apiUrl,
-            apiToken,
-            bankId: resolution.bankId,
-          });
-          return tools.map((t) => ({
-            name: t.name,
-            label: t.label,
-            description: t.description,
-            parameters: t.parameters,
-            async execute(_id: string, params: Record<string, unknown>) {
-              if (resolution.identityError) {
-                return {
-                  content: [{ type: "text", text: resolution.identityError }],
-                  details: {},
-                };
-              }
-              const config = currentPluginConfig || pluginConfig;
-              await ensureBankDefaultsApplied(resolution.bankId, config);
-              return { ...(await t.execute(params)), details: {} };
-            },
-          }));
-        };
-
-        api.registerTool(factory, {
-          names: [...TOOL_NAMES],
-          optional: false,
-        });
-        log.info("knowledge tools registered");
-      } catch (err) {
-        log.warn(`knowledge tools registration failed: ${err}`);
-      }
-    }
   } catch (error) {
     log.error("plugin loading error", error);
     if (error instanceof Error) {

@@ -275,20 +275,6 @@ enum BankCommands {
         mission: String,
     },
 
-    /// Set or merge bank background (deprecated: use mission instead)
-    #[command(hide = true)]
-    Background {
-        /// Bank ID
-        bank_id: String,
-
-        /// Background content
-        content: String,
-
-        /// Skip automatic disposition inference
-        #[arg(long)]
-        no_update_disposition: bool,
-    },
-
     /// Get memory graph data
     Graph {
         /// Bank ID
@@ -311,6 +297,12 @@ enum BankCommands {
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
+    },
+
+    /// Manage the extra ids this bank also answers to
+    Alias {
+        #[command(subcommand)]
+        command: BankAliasCommands,
     },
 
     /// Trigger consolidation to create/update observations
@@ -415,7 +407,7 @@ enum BankCommands {
         yes: bool,
     },
 
-    /// Set disposition traits directly (1-5 each, via PUT /profile)
+    /// Set disposition traits directly (1-5 each, stored as bank config)
     SetDisposition {
         /// Bank ID
         bank_id: String,
@@ -461,6 +453,50 @@ enum BankCommands {
 
     /// Print the bank template JSON schema
     TemplateSchema,
+}
+
+#[derive(Subcommand)]
+enum BankAliasCommands {
+    /// List the ids that also reach this bank
+    List {
+        /// Bank ID
+        bank_id: String,
+    },
+
+    /// Add an id that also reaches this bank
+    Add {
+        /// Bank ID
+        bank_id: String,
+
+        /// The extra id. Must not already name a bank or another alias.
+        alias: String,
+    },
+
+    /// Show this bank under one of its aliases instead of its own id
+    Primary {
+        /// Bank ID
+        bank_id: String,
+
+        /// The alias to present the bank under
+        alias: String,
+
+        /// Go back to showing the bank's own id
+        #[arg(long)]
+        clear: bool,
+    },
+
+    /// Stop an id reaching this bank (the bank and its memories are untouched)
+    Remove {
+        /// Bank ID
+        bank_id: String,
+
+        /// The alias to detach
+        alias: String,
+
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -754,9 +790,10 @@ enum DocumentCommands {
         /// Document ID
         document_id: String,
 
-        /// New tag list (comma-separated). Triggers observation invalidation + re-consolidation.
+        /// New tag list (comma-separated); `--tags ""` removes every tag. Triggers observation
+        /// invalidation + re-consolidation.
         #[arg(long, value_delimiter = ',')]
-        tags: Vec<String>,
+        tags: Option<Vec<String>>,
     },
 }
 
@@ -808,7 +845,7 @@ enum OperationCommands {
         operation_id: String,
     },
 
-    /// Cancel a pending async operation
+    /// Cancel a pending or in-flight async operation
     Cancel {
         /// Bank ID
         bank_id: String,
@@ -1164,6 +1201,19 @@ enum KnowledgeBaseCommands {
     Tree {
         /// Bank ID
         bank_id: String,
+
+        /// Only pages carrying these tags (comma-separated, e.g. user:alice,team)
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+
+        /// Tag matching mode: any, all, any_strict, all_strict, exact (default: any,
+        /// which also returns untagged pages)
+        #[arg(long)]
+        tags_match: Option<String>,
+
+        /// Compound tag filter as JSON, same shape as recall's tag_groups
+        #[arg(long)]
+        tag_groups: Option<String>,
     },
 
     /// Create a folder
@@ -1233,6 +1283,19 @@ enum KnowledgeBaseCommands {
         /// Maximum results to return (1-50)
         #[arg(long)]
         limit: Option<u64>,
+
+        /// Only pages carrying these tags (comma-separated, e.g. user:alice,team)
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+
+        /// Tag matching mode: any, all, any_strict, all_strict, exact (default: any,
+        /// which also returns untagged pages)
+        #[arg(long)]
+        tags_match: Option<String>,
+
+        /// Compound tag filter as JSON, same shape as recall's tag_groups
+        #[arg(long)]
+        tag_groups: Option<String>,
     },
 
     /// Rename/move a node, or update a page's options
@@ -1357,6 +1420,22 @@ enum DirectiveCommands {
 }
 
 fn main() {
+    // Rust ignores SIGPIPE at startup so that `println!`/`print!` surface a
+    // closed stdout pipe as an `EPIPE` error rather than a signal. But the
+    // release profile sets `panic = "abort"`, so that write error becomes a
+    // silent SIGABRT — a spurious "fatal error" with no message — whenever
+    // the reader closes early (e.g. `hindsight ... | head`).
+    //
+    // Restore the default SIGPIPE disposition on Unix so the CLI terminates
+    // cleanly on a broken pipe, like other Unix CLI tools. Note this also
+    // applies to socket writes: on Linux a peer closing a connection mid-write
+    // surfaces as SIGPIPE rather than an `Err(EPIPE)`. ripgrep and fd accept
+    // the same trade-off, and it is the correct behavior here too.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     if let Err(e) = run() {
         ui::print_error(&format!("{:#}", e));
         std::process::exit(1);
@@ -1469,18 +1548,6 @@ fn run() -> Result<()> {
             BankCommands::Mission { bank_id, mission } => {
                 commands::bank::mission(&client, &bank_id, &mission, verbose, output_format)
             }
-            BankCommands::Background {
-                bank_id,
-                content,
-                no_update_disposition,
-            } => commands::bank::update_background(
-                &client,
-                &bank_id,
-                &content,
-                no_update_disposition,
-                verbose,
-                output_format,
-            ),
             BankCommands::Graph {
                 bank_id,
                 fact_type,
@@ -1489,6 +1556,38 @@ fn run() -> Result<()> {
             BankCommands::Delete { bank_id, yes } => {
                 commands::bank::delete(&client, &bank_id, yes, verbose, output_format)
             }
+            BankCommands::Alias { command } => match command {
+                BankAliasCommands::List { bank_id } => {
+                    commands::bank::alias_list(&client, &bank_id, verbose, output_format)
+                }
+                BankAliasCommands::Add { bank_id, alias } => {
+                    commands::bank::alias_add(&client, &bank_id, &alias, verbose, output_format)
+                }
+                BankAliasCommands::Primary {
+                    bank_id,
+                    alias,
+                    clear,
+                } => commands::bank::alias_primary(
+                    &client,
+                    &bank_id,
+                    &alias,
+                    !clear,
+                    verbose,
+                    output_format,
+                ),
+                BankAliasCommands::Remove {
+                    bank_id,
+                    alias,
+                    yes,
+                } => commands::bank::alias_remove(
+                    &client,
+                    &bank_id,
+                    &alias,
+                    yes,
+                    verbose,
+                    output_format,
+                ),
+            },
             BankCommands::Consolidate {
                 bank_id,
                 wait,
@@ -1763,12 +1862,14 @@ fn run() -> Result<()> {
                 document_id,
                 tags,
             } => {
-                let tag_opt = if tags.is_empty() { None } else { Some(tags) };
+                // `--tags ""` parses as one empty tag; drop blanks so it clears the set
+                // instead of storing "".
+                let tags = tags.map(|t| t.into_iter().filter(|tag| !tag.is_empty()).collect());
                 commands::document::update(
                     &client,
                     &bank_id,
                     &document_id,
-                    tag_opt,
+                    tags,
                     verbose,
                     output_format,
                 )
@@ -1971,9 +2072,18 @@ fn run() -> Result<()> {
 
         // Knowledge base commands
         Commands::KnowledgeBase(kb_cmd) => match kb_cmd {
-            KnowledgeBaseCommands::Tree { bank_id } => {
-                commands::knowledge_base::tree(&client, &bank_id, verbose, output_format)
-            }
+            KnowledgeBaseCommands::Tree {
+                bank_id,
+                tags,
+                tags_match,
+                tag_groups,
+            } => commands::knowledge_base::tree(
+                &client,
+                &bank_id,
+                &commands::knowledge_base::tag_filter(tags, tags_match, tag_groups)?,
+                verbose,
+                output_format,
+            ),
             KnowledgeBaseCommands::CreateFolder {
                 bank_id,
                 name,
@@ -2021,11 +2131,15 @@ fn run() -> Result<()> {
                 bank_id,
                 query,
                 limit,
+                tags,
+                tags_match,
+                tag_groups,
             } => commands::knowledge_base::search(
                 &client,
                 &bank_id,
                 &query,
                 limit,
+                &commands::knowledge_base::tag_filter(tags, tags_match, tag_groups)?,
                 verbose,
                 output_format,
             ),

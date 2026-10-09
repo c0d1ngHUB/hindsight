@@ -7,8 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 from hindsight_api.engine.db.ops import LinkExpansionRows
-from hindsight_api.engine.search import link_expansion_retrieval
-from hindsight_api.engine.search.link_expansion_retrieval import LinkExpansionRetriever
+from hindsight_api.engine.memories.pg import link_expansion
+from hindsight_api.engine.memories.pg.link_expansion import LinkExpansionRetriever
 from hindsight_api.engine.search.types import RetrievalResult
 
 
@@ -42,25 +42,27 @@ async def test_activation_preserves_additive_score_across_fact_types(monkeypatch
         # lookup rather than injecting seeds through retrieve().
         return [RetrievalResult(id=f"seed-{fact_type}", text="seed", fact_type=fact_type)]
 
-    monkeypatch.setattr(link_expansion_retrieval, "acquire_with_retry", fake_acquire_with_retry)
-    monkeypatch.setattr(link_expansion_retrieval, "_find_semantic_seeds", fake_find_semantic_seeds)
+    monkeypatch.setattr(link_expansion, "acquire_with_retry", fake_acquire_with_retry)
+    monkeypatch.setattr(link_expansion, "_find_semantic_seeds", fake_find_semantic_seeds)
     monkeypatch.setattr(retriever, "_expand_combined", fake_expand_combined)
     pool = SimpleNamespace(ops=object())
 
-    world_results, _ = await retriever.retrieve(
+    retrieved = await retriever.retrieve(
         pool,
         query_embedding_str="unused",
         bank_id="bank",
         fact_type="world",
         budget=2,
     )
-    experience_results, _ = await retriever.retrieve(
+    world_results = retrieved.results
+    retrieved = await retriever.retrieve(
         pool,
         query_embedding_str="unused",
         bank_id="bank",
         fact_type="experience",
         budget=2,
     )
+    experience_results = retrieved.results
 
     combined = world_results + experience_results
     combined.sort(key=lambda result: result.activation or 0.0, reverse=True)
@@ -85,11 +87,11 @@ async def test_preselected_semantic_seeds_skip_seed_query(monkeypatch):
         assert set(seed_ids) == {"seed-a", "seed-b"}
         return LinkExpansionRows(entity=[_row("result", 1.0, fact_type)], semantic=[], causal=[])
 
-    monkeypatch.setattr(link_expansion_retrieval, "acquire_with_retry", fake_acquire_with_retry)
-    monkeypatch.setattr(link_expansion_retrieval, "_find_semantic_seeds", fail_find_semantic_seeds)
+    monkeypatch.setattr(link_expansion, "acquire_with_retry", fake_acquire_with_retry)
+    monkeypatch.setattr(link_expansion, "_find_semantic_seeds", fail_find_semantic_seeds)
     monkeypatch.setattr(retriever, "_expand_combined", fake_expand_combined)
 
-    results, timings = await retriever.retrieve(
+    retrieved = await retriever.retrieve(
         SimpleNamespace(ops=object()),
         query_embedding_str="unused",
         bank_id="bank",
@@ -100,6 +102,8 @@ async def test_preselected_semantic_seeds_skip_seed_query(monkeypatch):
             RetrievalResult(id="seed-b", text="seed", fact_type="world"),
         ],
     )
+    results = retrieved.results
+    timings = retrieved.timings
 
     assert [result.id for result in results] == ["result"]
     assert timings is not None
@@ -117,10 +121,10 @@ async def test_empty_preselected_semantic_seeds_do_not_fall_back(monkeypatch):
     async def fail_find_semantic_seeds(*args, **kwargs):
         raise AssertionError("an empty shared pool must not trigger a second seed query")
 
-    monkeypatch.setattr(link_expansion_retrieval, "acquire_with_retry", fake_acquire_with_retry)
-    monkeypatch.setattr(link_expansion_retrieval, "_find_semantic_seeds", fail_find_semantic_seeds)
+    monkeypatch.setattr(link_expansion, "acquire_with_retry", fake_acquire_with_retry)
+    monkeypatch.setattr(link_expansion, "_find_semantic_seeds", fail_find_semantic_seeds)
 
-    results, timings = await retriever.retrieve(
+    retrieved = await retriever.retrieve(
         SimpleNamespace(ops=object()),
         query_embedding_str="unused",
         bank_id="bank",
@@ -128,6 +132,8 @@ async def test_empty_preselected_semantic_seeds_do_not_fall_back(monkeypatch):
         budget=2,
         preselected_semantic_seeds=[],
     )
+    results = retrieved.results
+    timings = retrieved.timings
 
     assert results == []
     assert timings is not None

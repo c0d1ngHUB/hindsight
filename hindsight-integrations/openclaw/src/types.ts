@@ -1,5 +1,7 @@
 // Moltbot plugin API types (minimal subset needed for this plugin)
 
+import type { MinScores } from "@vectorize-io/hindsight-client";
+
 export interface PluginPromptHookResult {
   prependContext?: string;
   prependSystemContext?: string;
@@ -14,24 +16,12 @@ export interface MoltbotPluginAPI {
     event: string,
     handler: (event: any, ctx?: any) => void | Promise<void | PluginPromptHookResult>
   ): void;
-  // Register a tool or tool factory for agents
-  registerTool?(
-    factory: (ctx: PluginToolContext) => any | any[] | null | undefined,
-    opts?: { name?: string; names?: string[]; optional?: boolean }
-  ): void;
   // OpenClaw framework logger — handles coloring/formatting consistently across plugins
   logger: {
     info(msg: string): void;
     warn(msg: string): void;
     error(msg: string): void;
   };
-}
-
-export interface PluginToolContext {
-  config?: MoltbotConfig;
-  agentId?: string;
-  sessionKey?: string;
-  workspaceDir?: string;
 }
 
 export interface MoltbotConfig {
@@ -100,6 +90,9 @@ export interface PluginConfig {
    */
   entityLabels?: unknown;
   embedPort?: number;
+  // Deprecated and ignored: the agent_knowledge_* tools were removed. Kept so
+  // existing configs that set it still pass the strict manifest schema.
+  enableKnowledgeTools?: boolean;
   daemonIdleTimeout?: number; // Seconds before daemon shuts down (0 = never)
   embedVersion?: string; // hindsight-embed version (default: "latest")
   embedPackagePath?: string; // Local path to hindsight package (e.g. '/path/to/hindsight')
@@ -113,6 +106,7 @@ export interface PluginConfig {
   dynamicBankId?: boolean; // Enable per-channel memory banks (default: true)
   bankId?: string; // Static bank ID used when dynamicBankId is false.
   bankIdPrefix?: string; // Prefix for bank IDs (e.g. 'prod' -> 'prod-slack-C123')
+  agentBankMap?: Record<string, string>; // Explicit agentId -> bankId routing, checked before static/dynamic derivation. Lets a group of agents share one named bank while others keep derived banks. Mapped names are used exactly as given (bankIdPrefix is not applied).
   retainTags?: string[]; // Tags applied to all retained documents after trimming and deduplication; auto-retain merges these with inline per-message retain-tag directives (e.g. ['source_system:openclaw', 'agent:agentname'])
   retainSource?: string; // Source written into retained document metadata (default: 'openclaw')
   retainContext?: string; // Interpretation guidance sent via the retain API context field. Defaults to built-in OpenClaw transcript/routing metadata guidance.
@@ -127,6 +121,7 @@ export interface PluginConfig {
   recallMaxTokens?: number; // Max tokens for recall response. Default: 1024
   recallTypes?: Array<"world" | "experience" | "observation">; // Memory types to recall. Default: ['observation'] — surfaces only the consolidated, deduplicated view (raw world/experience facts can drive the same answer multiple times when many memories say the same thing).
   preferObservations?: boolean; // When true, recall drops raw facts already consolidated into an observation while keeping unconsolidated ones. Pair with recallTypes including raw types to catch just-retained facts without duplicating consolidated content. Default: false.
+  recallMinScores?: MinScores; // Optional per-stage score floors. Missing fields impose no floor; missing/null result scores pass.
   recallRoles?: Array<"user" | "assistant" | "system" | "tool">; // Roles to include when composing contextual recall query. Default: ['user', 'assistant']
   retainEveryNTurns?: number; // Retain every Nth turn (1 = every turn, default: 1). Values > 1 enable chunked retention.
   retainOverlapTurns?: number; // Extra prior turns included when chunked retention fires (default: 0). Window = retainEveryNTurns + retainOverlapTurns.
@@ -145,7 +140,6 @@ export interface PluginConfig {
   retainQueuePath?: string; // Path to JSONL file for buffering failed retains. Default: ~/.openclaw/data/hindsight-retain-queue.jsonl
   retainQueueMaxAgeMs?: number; // Max age in ms for queued items. -1 = keep forever (default: -1)
   retainQueueFlushIntervalMs?: number; // How often to attempt flushing the queue in ms. Default: 60000 (1 min)
-  enableKnowledgeTools?: boolean; // Register agent_knowledge_* tools. Default: false. Set to true by the self-driving-agents CLI.
   /**
    * Regex source matching a human display-name prefix that some channels
    * prepend to user text ("Alice: today weather?"). Supply the name part only

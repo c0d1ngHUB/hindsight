@@ -37,7 +37,7 @@ func main() {
 	} {
 		client.MemoryAPI.RetainMemories(ctx, kpBankID).
 			RetainRequest(hindsight.RetainRequest{
-				Items: []hindsight.MemoryItem{{Content: content}},
+				Items: []hindsight.MemoryItem{{Content: hindsight.TextContent(content)}},
 			}).Execute()
 	}
 	time.Sleep(2 * time.Second)
@@ -98,6 +98,19 @@ func main() {
 		fmt.Printf("%.3f  %s: %s\n", hit.Score, hit.Name, hit.Snippet)
 	}
 	// [/docs:search-pages]
+
+	// [docs:filter-by-tags]
+	// Narrow the tree and search to pages carrying a tag (recall's tags / tags_match / tag_groups)
+	runbooks, _, _ := client.KnowledgeBaseAPI.GetKnowledgeBaseTree(ctx, kpBankID).
+		Tags([]string{"type:runbook"}).TagsMatch("any_strict").Execute()
+	fmt.Printf("runbook roots: %d\n", len(runbooks.Roots))
+
+	// Compound filters use tag_groups, sent as one JSON-encoded query param
+	notDrafts, _, _ := client.KnowledgeBaseAPI.SearchKnowledgeBase(ctx, kpBankID).
+		Q("how do we deploy").
+		TagGroups(`[{"and":[{"tags":["type:runbook"]},{"not":{"tags":["draft"]}}]}]`).Execute()
+	fmt.Printf("non-draft hits: %d\n", len(notDrafts.Results))
+	// [/docs:filter-by-tags]
 
 	// [docs:update-node]
 	// Rename a node, move it, and/or update a page's options.

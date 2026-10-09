@@ -7,47 +7,14 @@ from datetime import datetime, timezone
 
 import pytest
 
-from hindsight_api import RequestContext
 from hindsight_api.engine.memory_engine import Budget
-from hindsight_api.extensions import (
-    OperationValidatorExtension,
-    RecallContext,
-    ReflectContext,
-    RetainContext,
-    RetainResult,
-    ValidationResult,
-)
+from tests.retain_result_capture import RetainResultCapture
 
 logger = logging.getLogger(__name__)
 
 
 def _ts():
     return datetime.now(timezone.utc).timestamp()
-
-
-class _RetainResultCapture(OperationValidatorExtension):
-    """Minimal OperationValidator that records each RetainResult it receives.
-
-    Used by tests to assert on fields the engine sets on RetainResult (e.g.
-    processed_content_tokens), without having to scrape logs or internals.
-    The pre-operation validators must be implemented to satisfy the
-    abstract base class, but they always accept.
-    """
-
-    def __init__(self) -> None:
-        self.results: list[RetainResult] = []
-
-    async def validate_retain(self, ctx: RetainContext) -> ValidationResult:
-        return ValidationResult.accept()
-
-    async def validate_recall(self, ctx: RecallContext) -> ValidationResult:
-        return ValidationResult.accept()
-
-    async def validate_reflect(self, ctx: ReflectContext) -> ValidationResult:
-        return ValidationResult.accept()
-
-    async def on_retain_complete(self, result: RetainResult) -> None:
-        self.results.append(result)
 
 
 # ============================================================
@@ -986,17 +953,15 @@ async def test_delta_retain_recall_with_chunks(memory, request_context):
 
 def test_merge_processed_content_tokens_helper():
     """Unit check on the None-propagating aggregator used by the engine."""
-    from hindsight_api.engine.retain.orchestrator import (
-        _merge_processed_content_tokens,
-    )
+    from hindsight_api.engine.retain.types import merge_processed_content_tokens
 
-    assert _merge_processed_content_tokens(0, 0) == 0
-    assert _merge_processed_content_tokens(5, 7) == 12
+    assert merge_processed_content_tokens(0, 0) == 0
+    assert merge_processed_content_tokens(5, 7) == 12
     # None "wins" in either slot — once any sub-result bypassed dedup, the
     # aggregate is None so callers bill full content.
-    assert _merge_processed_content_tokens(None, 10) is None
-    assert _merge_processed_content_tokens(10, None) is None
-    assert _merge_processed_content_tokens(None, None) is None
+    assert merge_processed_content_tokens(None, 10) is None
+    assert merge_processed_content_tokens(10, None) is None
+    assert merge_processed_content_tokens(None, None) is None
 
 
 @pytest.mark.asyncio
@@ -1008,7 +973,7 @@ async def test_processed_content_tokens_first_retain_is_none(memory, request_con
     """
     bank_id = f"test_pct_first_{_ts()}"
     document_id = "new-doc"
-    capture = _RetainResultCapture()
+    capture = RetainResultCapture()
     memory._operation_validator = capture
 
     try:
@@ -1036,7 +1001,7 @@ async def test_processed_content_tokens_unchanged_resubmit_is_zero(memory, reque
     """
     bank_id = f"test_pct_unchanged_{_ts()}"
     document_id = "conversation-001"
-    capture = _RetainResultCapture()
+    capture = RetainResultCapture()
     memory._operation_validator = capture
     content = "Alice works at Google. Bob works at Microsoft."
 
@@ -1075,7 +1040,7 @@ async def test_processed_content_tokens_appended_reports_delta(memory, request_c
     """
     bank_id = f"test_pct_appended_{_ts()}"
     document_id = "growing-doc"
-    capture = _RetainResultCapture()
+    capture = RetainResultCapture()
     memory._operation_validator = capture
 
     v1 = "Alice works at Google."
@@ -1135,7 +1100,7 @@ async def test_processed_content_tokens_without_document_id_is_none(memory, requ
     and let the caller bill the full submitted payload.
     """
     bank_id = f"test_pct_no_doc_{_ts()}"
-    capture = _RetainResultCapture()
+    capture = RetainResultCapture()
     memory._operation_validator = capture
 
     try:

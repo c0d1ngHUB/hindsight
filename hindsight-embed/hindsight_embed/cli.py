@@ -35,7 +35,7 @@ CONFIG_DIR = Path.home() / ".hindsight"
 CONFIG_FILE = CONFIG_DIR / "embed"
 CONFIG_FILE_ALT = CONFIG_DIR / "config.env"  # Alternative config file location
 
-# Module-level variable to store CLI profile override (set by argparse)
+# None means no flag; an empty string explicitly selects the default profile.
 _cli_profile_override: str | None = None
 
 
@@ -43,7 +43,7 @@ def get_cli_profile_override() -> str | None:
     """Get the profile override from CLI flag (--profile).
 
     Returns:
-        Profile name if set via CLI flag, None otherwise.
+        Profile name if set via CLI flag (empty string for default), None otherwise.
     """
     return _cli_profile_override
 
@@ -52,7 +52,7 @@ def set_cli_profile_override(profile: str | None) -> None:
     """Set the profile override from CLI flag (--profile).
 
     Args:
-        profile: Profile name to set, or None to clear.
+        profile: Profile name to set (empty string for default), or None to clear.
     """
     global _cli_profile_override
     _cli_profile_override = profile
@@ -77,9 +77,6 @@ def setup_logging(verbose: bool = False):
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         stream=sys.stderr,
     )
-
-    # Set httpx to warning level to reduce noise
-    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     return logging.getLogger(__name__)
 
@@ -115,26 +112,36 @@ def load_config_file():
                         os.environ[key] = value
 
 
-def get_config():
-    """Get configuration from environment variables.
+ENV_LLM_PROVIDER = "HINDSIGHT_API_LLM_PROVIDER"
+ENV_LLM_API_KEY = "HINDSIGHT_API_LLM_API_KEY"
 
-    `llm_model` is left unset (None) when the env var is missing — the daemon's
-    hindsight-api process owns `PROVIDER_DEFAULT_MODELS` and resolves the
-    provider-keyed default itself. Duplicating that table here would silently
-    desync, and importing it from `hindsight_api.config` fails in standalone
-    venvs (e.g. `uvx hindsight-embed`) where `hindsight-api` isn't installed.
+
+def get_config() -> dict[str, str]:
+    """This invocation's daemon overrides, as ``HINDSIGHT_*`` environment variables.
+
+    Every ``HINDSIGHT_*`` variable in the process environment is forwarded
+    verbatim; there is no whitelist of known settings. A whitelist is exactly
+    how ``HINDSIGHT_API_LLM_BASE_URL`` came to be dropped while KEY/MODEL
+    applied (issue #4094) — ``hindsight-api``, not this wrapper, owns the list
+    of settings that exist, and it grows every release.
+
+    No provider or model default is injected: ``hindsight-api`` resolves both
+    (its ``DEFAULT_LLM_PROVIDER`` is this same ``"openai"``, and
+    ``PROVIDER_DEFAULT_MODELS`` is provider-keyed). Duplicating those tables
+    here would silently desync — and importing them fails in standalone venvs
+    (``uvx hindsight-embed``) where ``hindsight-api`` isn't installed anyway.
     """
     load_config_file()
-    provider = os.environ.get("HINDSIGHT_API_LLM_PROVIDER", "openai")
-    return {
-        "llm_api_key": (
-            None
-            if provider in NO_API_KEY_PROVIDERS
-            else os.environ.get("HINDSIGHT_API_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
-        ),
-        "llm_provider": provider,
-        "llm_model": os.environ.get("HINDSIGHT_API_LLM_MODEL"),
-    }
+    config = {key: value for key, value in os.environ.items() if key.startswith("HINDSIGHT_")}
+
+    # OPENAI_API_KEY is the one non-HINDSIGHT_ name honoured here, and only for
+    # providers that authenticate with an LLM API key at all.
+    provider = config.get(ENV_LLM_PROVIDER) or "openai"
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if openai_key and ENV_LLM_API_KEY not in config and provider not in NO_API_KEY_PROVIDERS:
+        config[ENV_LLM_API_KEY] = openai_key
+
+    return config
 
 
 # Provider -> API-key env var (None = no key needed)
@@ -246,11 +253,20 @@ def _do_configure_from_env():
     # Save configuration
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-    config_values = {"HINDSIGHT_API_LLM_PROVIDER": provider}
-    if model:
-        config_values["HINDSIGHT_API_LLM_MODEL"] = model
+    # Persist every HINDSIGHT_API_* variable the caller set, not a hand-listed
+    # subset: the subset is why HINDSIGHT_API_LLM_BASE_URL never reached the
+    # written profile (issue #4094). HINDSIGHT_EMBED_* is deliberately excluded
+    # — those configure this wrapper for one invocation (API URL, component
+    # versions), and baking them into the profile is not what a user setting
+    # them for a single `configure` run asked for.
+    config_values = {key: value for key, value in os.environ.items() if key.startswith("HINDSIGHT_API_") and value}
+    config_values[ENV_LLM_PROVIDER] = provider
     if api_key:
-        config_values["HINDSIGHT_API_LLM_API_KEY"] = api_key
+        config_values[ENV_LLM_API_KEY] = api_key
+    else:
+        # Providers in NO_API_KEY_PROVIDERS authenticate locally; don't persist
+        # a stale key that the resolved provider will never use.
+        config_values.pop(ENV_LLM_API_KEY, None)
 
     from .env_template import render_config
 
@@ -453,12 +469,7 @@ def _do_configure_interactive(profile_name: str | None = None, port: int | None 
         daemon_client.stop_daemon(daemon_profile)
 
     # Start daemon with new config
-    new_config = {
-        "llm_api_key": api_key,
-        "llm_provider": provider,
-        "llm_model": model,
-    }
-    if daemon_client.ensure_daemon_running(new_config, daemon_profile):
+    if daemon_client.ensure_daemon_running(dict(config_dict), daemon_profile):
         print("  \033[32m✓ Daemon started\033[0m")
     else:
         print("  \033[33m⚠ Failed to start daemon (will start on first command)\033[0m")
@@ -490,7 +501,7 @@ def do_daemon(args, config: dict, logger):
 
     # Get profile-specific paths
     pm = ProfileManager()
-    paths = pm.resolve_profile_paths(profile or "")
+    paths = pm.resolve_profile_paths(profile)
 
     daemon_log_path = paths.log
     port = paths.port
@@ -524,12 +535,10 @@ def do_daemon(args, config: dict, logger):
             # Start UI if --ui flag was passed
             if getattr(args, "ui", False):
                 from .daemon_embed_manager import DaemonEmbedManager
-                from .profile_manager import resolve_active_profile
 
-                # Use the same profile resolution as the daemon
-                resolved_profile = profile if profile is not None else resolve_active_profile()
+                # main() already resolved the profile the daemon was started with
                 manager = DaemonEmbedManager()
-                ui_started = manager.start_ui(resolved_profile, None, "0.0.0.0")
+                ui_started = manager.start_ui(profile, None, "0.0.0.0")
                 if not ui_started:
                     console.print(
                         Panel(
@@ -700,7 +709,7 @@ def do_ui(args, config: dict, logger):
 
     # Resolve default UI port (from the profile's .env, else API + offset)
     pm = ProfileManager()
-    paths = pm.resolve_profile_paths(profile or "")
+    paths = pm.resolve_profile_paths(profile)
     default_ui_port = paths.ui_port
 
     if args.ui_command == "start":
@@ -1412,11 +1421,9 @@ def do_profile_command(args: list[str]) -> int:
 
         # Determine source
         source = "default"
-        if not active_profile:
-            source = "default"
-        elif os.getenv("HINDSIGHT_EMBED_PROFILE"):
+        if os.getenv("HINDSIGHT_EMBED_PROFILE"):
             source = "HINDSIGHT_EMBED_PROFILE"
-        elif get_cli_profile_override():
+        elif get_cli_profile_override() is not None:
             source = "cli_flag"
         elif pm.get_active_profile():
             source = "active_profile_file"
@@ -1460,7 +1467,7 @@ def do_profile_command(args: list[str]) -> int:
     return 1
 
 
-def main():
+def main() -> None:
     """Main entry point."""
     # Windows defaults stdout/stderr to the legacy cp1252 codec, which crashes
     # on the Unicode glyphs (✓, box-drawing, etc.) used throughout Rich-rendered
@@ -1482,7 +1489,7 @@ def main():
     global_args, remaining_args = parent_parser.parse_known_args()
     global_profile = global_args.profile
     if global_profile == "default":
-        global_profile = None
+        global_profile = ""
 
     # Set the CLI profile override so it's available to resolve_active_profile()
     # This must happen BEFORE any config loading (load_config_file, get_config, etc.)
@@ -1534,6 +1541,12 @@ def main():
             exit_code = do_profile_command(remaining_args[1:])  # Skip 'profile' itself
             sys.exit(exit_code)
 
+        from .profile_manager import resolve_active_profile
+
+        # Configuration and every command target must use the same priority chain.
+        # Passing the raw flag used to bypass env/active selection for some commands.
+        resolved_profile = resolve_active_profile()
+
         # Handle daemon subcommands
         if command == "daemon":
             # Parse daemon subcommand (profile already extracted globally)
@@ -1548,8 +1561,7 @@ def main():
             logs_parser.add_argument("--lines", "-n", type=int, default=50)
 
             args = parser.parse_args(remaining_args[1:])  # Skip 'daemon' itself
-            # Use globally extracted profile
-            args.profile = global_profile
+            args.profile = resolved_profile
             logger = setup_logging(False)
             config = get_config()
             exit_code = do_daemon(args, config, logger)
@@ -1573,7 +1585,7 @@ def main():
             logs_parser.add_argument("--lines", "-n", type=int, default=50)
 
             args = parser.parse_args(remaining_args[1:])
-            args.profile = global_profile
+            args.profile = resolved_profile
             logger = setup_logging(False)
             config = get_config()
             exit_code = do_ui(args, config, logger)
@@ -1620,9 +1632,9 @@ def main():
         from . import daemon_client
 
         # Forward to hindsight-cli (handles daemon startup and CLI installation)
-        # Pass the globally extracted profile
+        # Pass the same resolved profile used to load the configuration.
         # remaining_args already has --profile/-p filtered out
-        exit_code = daemon_client.run_cli(remaining_args, config, global_profile)
+        exit_code = daemon_client.run_cli(remaining_args, config, resolved_profile)
         sys.exit(exit_code)
 
     # No command - show help

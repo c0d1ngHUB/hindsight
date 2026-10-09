@@ -14,10 +14,14 @@ import argparse
 import asyncio
 import atexit
 import dataclasses
+import errno
 import os
 import signal
+import socket
 import sys
+import time
 import warnings
+from typing import Any
 
 import uvicorn
 
@@ -25,9 +29,9 @@ from . import __version__
 from .banner import print_banner
 from .config import (
     DEFAULT_ACCESS_LOG,
+    DEFAULT_HOST,
     DEFAULT_WORKERS,
     ENV_ACCESS_LOG,
-    ENV_HOST,
     ENV_WORKERS,
     HindsightConfig,
     _get_raw_config,
@@ -56,7 +60,6 @@ from .daemon import (
 _LAZY_IMPORTS: "dict[str, tuple[str, str]]" = {
     "MemoryEngine": (".", "MemoryEngine"),
     "create_app": (".api", "create_app"),
-    "DefaultExtensionContext": (".extensions", "DefaultExtensionContext"),
     "OperationValidatorExtension": (".extensions", "OperationValidatorExtension"),
     "TenantExtension": (".extensions", "TenantExtension"),
     "load_extension": (".extensions", "load_extension"),
@@ -119,20 +122,61 @@ def resolve_daemon_host_port(
     args_port: int,
     explicit_host: bool,
     explicit_port: bool,
+    configured_host: bool = False,
 ) -> ResolvedDaemonHostPort:
     """Resolve host/port for daemon mode.
 
-    Defaults to 127.0.0.1 for security, but honors explicit user overrides
-    via --host flag or HINDSIGHT_API_HOST env var. Uses DEFAULT_DAEMON_PORT
-    unless the user specified a custom port.
+    Defaults to 127.0.0.1 for security, but honors explicit user overrides via the
+    --host flag (``explicit_host``) or HINDSIGHT_API_HOST (``configured_host``, which
+    the caller reads off the config rather than the environment). Uses
+    DEFAULT_DAEMON_PORT unless the user specified a custom port.
     """
     port = args_port if explicit_port else DEFAULT_DAEMON_PORT
     # Only force localhost if the user didn't explicitly set a host
-    if explicit_host or os.environ.get(ENV_HOST):
-        host = args_host
-    else:
-        host = "127.0.0.1"
+    host = args_host if (explicit_host or configured_host) else "127.0.0.1"
     return ResolvedDaemonHostPort(host=host, port=port)
+
+
+def _port_bind_error(host: str, port: int) -> OSError | None:
+    """Return the error uvicorn's bind would raise for host:port, or None if it would succeed.
+
+    uvicorn only binds after the app's startup has run — embedded PostgreSQL, model loading,
+    migrations — so an occupied port otherwise costs a full initialization before failing, which
+    a supervisor with Restart=always turns into a restart storm (#4281).
+
+    This mirrors uvicorn's own TCP bind (Config.bind_socket: address family from the host string,
+    SO_REUSEADDR) so it can only fail where uvicorn would, and it never calls listen(): nothing can
+    connect to the probe, and the socket is released before uvicorn binds for real. A listener
+    appearing between the two is not caught here; uvicorn then fails exactly as it did before.
+    """
+    family = socket.AF_INET6 if host and ":" in host else socket.AF_INET
+    with socket.socket(family=family) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+        except OSError as exc:
+            return exc
+    return None
+
+
+# How long an "address in use" is retried before giving up. Before the pre-flight probe, the
+# ~10s of initialization ahead of uvicorn's bind silently absorbed a previous instance that was
+# still releasing the port (a restart that doesn't wait for the old process to exit); failing on
+# the first attempt would turn that into a spurious exit. Matches uvicorn's graceful-shutdown cap.
+_PORT_IN_USE_GRACE_SECONDS = 5.0
+_PORT_IN_USE_RETRY_INTERVAL = 0.5
+# Windows reports WSAEADDRINUSE (10048) rather than errno.EADDRINUSE.
+_ADDR_IN_USE_ERRNOS = {errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", errno.EADDRINUSE)}
+
+
+def _wait_for_port(host: str, port: int) -> OSError | None:
+    """Probe the bind, retrying "address in use" for a short grace window; return the final error."""
+    deadline = time.monotonic() + _PORT_IN_USE_GRACE_SECONDS
+    error = _port_bind_error(host, port)
+    while error is not None and error.errno in _ADDR_IN_USE_ERRNOS and time.monotonic() < deadline:
+        time.sleep(_PORT_IN_USE_RETRY_INTERVAL)
+        error = _port_bind_error(host, port)
+    return error
 
 
 @dataclasses.dataclass(frozen=True)
@@ -152,7 +196,9 @@ def _parse_cli_args(argv: list[str], config: HindsightConfig) -> ParsedCliArgs:
     parser.add_argument(
         "--host",
         default=argparse.SUPPRESS,
-        help=f"Host to bind to (default: {config.host}, env: HINDSIGHT_API_HOST)",
+        # config.host is None when nothing configured one; show the address that will
+        # actually be bound, not the sentinel that stands for "operator said nothing".
+        help=f"Host to bind to (default: {config.host or DEFAULT_HOST}, env: HINDSIGHT_API_HOST)",
     )
     parser.add_argument(
         "--port",
@@ -172,7 +218,7 @@ def _parse_cli_args(argv: list[str], config: HindsightConfig) -> ParsedCliArgs:
     parser.add_argument(
         "--workers",
         type=int,
-        default=int(os.getenv(ENV_WORKERS, str(DEFAULT_WORKERS))),
+        default=config.workers,
         help=f"Number of worker processes (env: {ENV_WORKERS}, default: {DEFAULT_WORKERS})",
     )
 
@@ -180,7 +226,7 @@ def _parse_cli_args(argv: list[str], config: HindsightConfig) -> ParsedCliArgs:
     parser.add_argument(
         "--access-log",
         action="store_true",
-        default=os.getenv(ENV_ACCESS_LOG, "").lower() in ("1", "true", "yes", "on") or DEFAULT_ACCESS_LOG,
+        default=config.access_log,
         help=f"Enable access log (env: {ENV_ACCESS_LOG}, default: {DEFAULT_ACCESS_LOG})",
     )
     parser.add_argument(
@@ -221,7 +267,7 @@ def _parse_cli_args(argv: list[str], config: HindsightConfig) -> ParsedCliArgs:
     explicit_host = hasattr(args, "host")
     explicit_port = hasattr(args, "port")
     if not explicit_host:
-        args.host = config.host
+        args.host = config.host or DEFAULT_HOST
     if not explicit_port:
         args.port = config.port
 
@@ -233,6 +279,13 @@ def main():
     global _memory
 
     load_dotenv_for_entrypoint()
+
+    # Arm profiling here, after .env is loaded and before anything starts serving, so a
+    # report covers the run rather than beginning halfway through it. No-op unless
+    # HINDSIGHT_API_PROFILE is set.
+    from hindsight_api.profiling import install as _install_profiling
+
+    _install_profiling()
 
     # Load configuration from environment (for CLI args defaults)
     config = _get_raw_config()
@@ -262,10 +315,19 @@ def main():
             args_port=args.port,
             explicit_host=parsed_cli_args.explicit_host,
             explicit_port=parsed_cli_args.explicit_port,
+            configured_host=config.host is not None,
         )
         args.host = resolved_daemon_host_port.host
         args.port = resolved_daemon_host_port.port
 
+    # Fail before any expensive initialization if the port cannot be bound. For --daemon this
+    # runs in the foreground parent too, so the error reaches the terminal instead of the log.
+    bind_error = _wait_for_port(args.host, args.port)
+    if bind_error is not None:
+        print(f"Error: cannot bind {args.host}:{args.port}: {bind_error}", file=sys.stderr)
+        sys.exit(1)
+
+    if is_daemon:
         # Detach into background (parent re-execs and exits; child redirects
         # stdio to log file).  No lockfile needed — port binding prevents
         # duplicate daemons.
@@ -300,7 +362,6 @@ def main():
     load_extension = _this.load_extension
     OperationValidatorExtension = _this.OperationValidatorExtension
     TenantExtension = _this.TenantExtension
-    DefaultExtensionContext = _this.DefaultExtensionContext
 
     # Load operation validator extension if configured
     operation_validator = load_extension("OPERATION_VALIDATOR", OperationValidatorExtension)
@@ -342,14 +403,9 @@ def main():
             run_migrations=config.run_migrations_on_startup,
         )
 
-        # Set extension context on tenant extension (needed for schema provisioning)
-        if tenant_extension:
-            extension_context = DefaultExtensionContext(
-                database_url=config.database_url,
-                memory_engine=_memory,
-            )
-            tenant_extension.set_context(extension_context)
-            logging.info("Extension context set on tenant extension")
+        # The extension context is set by MemoryEngine.__init__ on every extension it owns
+        # (tenant extension, operation validator), from the same context it gives the memory
+        # defense extension -- there is one per process, not one per construction site.
 
         # Create FastAPI app
         app = create_app(
@@ -380,7 +436,13 @@ def main():
         except ImportError:
             print("uvloop not installed, using default asyncio event loop")
 
-    uvicorn_config = {
+    # `dict[str, Any]`, explicitly: this is a kwargs BAG, assembled conditionally from parsed
+    # CLI args below, and unpacked into a signature with ~30 differently-typed parameters.
+    # Inferred, its value type is the union of everything put in it, and the `**` unpack is
+    # then checked as if every key could be every type -- one diagnostic per uvicorn
+    # parameter, none of them a real defect. The types that matter here are argparse's, and
+    # they are checked where the args are declared.
+    uvicorn_config: dict[str, Any] = {
         "app": "hindsight_api.server:app" if use_import_string else app,
         "host": args.host,
         "port": args.port,
@@ -398,6 +460,10 @@ def main():
         uvicorn_config["reload"] = True
     if args.workers > 1:
         uvicorn_config["workers"] = args.workers
+    # Export the worker count so each child process can size its share of the CPU
+    # budget (admission limits are per worker). uvicorn spawns children that
+    # re-import the app, so the environment is the only channel that reaches them.
+    os.environ[ENV_WORKERS] = str(args.workers)
     if args.forwarded_allow_ips:
         uvicorn_config["forwarded_allow_ips"] = args.forwarded_allow_ips
     if args.ssl_keyfile:

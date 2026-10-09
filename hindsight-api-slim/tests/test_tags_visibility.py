@@ -16,6 +16,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
+from hindsight_api import RequestContext
 from hindsight_api.api import create_app
 from hindsight_api.engine.search.tags import (
     TagGroupAnd,
@@ -27,6 +28,8 @@ from hindsight_api.engine.search.tags import (
     build_tags_where_clause_simple,
     filter_results_by_tag_groups,
     filter_results_by_tags,
+    strict_tag_group,
+    strict_tags_match,
 )
 
 # ============================================================================
@@ -172,7 +175,10 @@ class TestTagsWhereClauseBuilder:
     def test_tags_where_clause_exact_empty_scope_keeps_param_offset(self, tags):
         """The parameterized builder must not consume a bind index for the empty scope,
         so following clauses stay aligned with their params."""
-        clause, params, next_offset = build_tags_where_clause(tags, param_offset=4, match="exact")
+        built = build_tags_where_clause(tags, param_offset=4, match="exact")
+        clause = built.sql
+        params = built.params
+        next_offset = built.next_param_offset
         assert clause == "AND (tags IS NULL OR tags = '{}')"
         assert params == []
         assert next_offset == 4
@@ -379,14 +385,20 @@ class TestBuildTagGroupsWhereClause:
 
     def test_none_returns_empty(self):
         """None tag_groups returns empty clause."""
-        clause, params, next_offset = build_tag_groups_where_clause(None, 3)
+        built = build_tag_groups_where_clause(None, 3)
+        clause = built.sql
+        params = built.params
+        next_offset = built.next_param_offset
         assert clause == ""
         assert params == []
         assert next_offset == 3
 
     def test_empty_list_returns_empty(self):
         """Empty tag_groups list returns empty clause."""
-        clause, params, next_offset = build_tag_groups_where_clause([], 3)
+        built = build_tag_groups_where_clause([], 3)
+        clause = built.sql
+        params = built.params
+        next_offset = built.next_param_offset
         assert clause == ""
         assert params == []
         assert next_offset == 3
@@ -394,7 +406,10 @@ class TestBuildTagGroupsWhereClause:
     def test_single_leaf_any_strict(self):
         """Single any_strict leaf generates correct SQL."""
         groups = [TagGroupLeaf(tags=["step:5", "step:8"], match="any_strict")]
-        clause, params, next_offset = build_tag_groups_where_clause(groups, 3)
+        built = build_tag_groups_where_clause(groups, 3)
+        clause = built.sql
+        params = built.params
+        next_offset = built.next_param_offset
         assert clause.startswith("AND ")
         assert "$3" in clause
         assert "IS NOT NULL" in clause
@@ -406,7 +421,10 @@ class TestBuildTagGroupsWhereClause:
     def test_single_leaf_all_strict(self):
         """Single all_strict leaf generates @> operator."""
         groups = [TagGroupLeaf(tags=["user:alice"], match="all_strict")]
-        clause, params, next_offset = build_tag_groups_where_clause(groups, 1)
+        built = build_tag_groups_where_clause(groups, 1)
+        clause = built.sql
+        params = built.params
+        next_offset = built.next_param_offset
         assert "@>" in clause
         assert "IS NOT NULL" in clause
         assert params == [["user:alice"]]
@@ -415,7 +433,10 @@ class TestBuildTagGroupsWhereClause:
     def test_single_leaf_any_includes_untagged(self):
         """Single any (non-strict) leaf generates NULL-inclusive clause."""
         groups = [TagGroupLeaf(tags=["user:alice"], match="any")]
-        clause, params, next_offset = build_tag_groups_where_clause(groups, 1)
+        built = build_tag_groups_where_clause(groups, 1)
+        clause = built.sql
+        params = built.params
+        next_offset = built.next_param_offset
         assert "IS NULL" in clause
         assert "= '{}'" in clause
         assert "&&" in clause
@@ -434,7 +455,10 @@ class TestBuildTagGroupsWhereClause:
                 }
             )
         ]
-        clause, params, next_offset = build_tag_groups_where_clause(groups, 3)
+        built = build_tag_groups_where_clause(groups, 3)
+        clause = built.sql
+        params = built.params
+        next_offset = built.next_param_offset
         assert "AND" in clause
         assert "$3" in clause
         assert "$4" in clause
@@ -455,7 +479,10 @@ class TestBuildTagGroupsWhereClause:
                 }
             )
         ]
-        clause, params, next_offset = build_tag_groups_where_clause(groups, 1)
+        built = build_tag_groups_where_clause(groups, 1)
+        clause = built.sql
+        params = built.params
+        next_offset = built.next_param_offset
         assert "OR" in clause
         assert "$1" in clause
         assert "$2" in clause
@@ -465,7 +492,10 @@ class TestBuildTagGroupsWhereClause:
     def test_not_wraps_with_not(self):
         """NOT group wraps child clause with NOT."""
         groups = [TagGroupNot.model_validate({"not": {"tags": ["archived"], "match": "any_strict"}})]
-        clause, params, next_offset = build_tag_groups_where_clause(groups, 2)
+        built = build_tag_groups_where_clause(groups, 2)
+        clause = built.sql
+        params = built.params
+        next_offset = built.next_param_offset
         assert "NOT" in clause
         assert "$2" in clause
         assert len(params) == 1
@@ -488,7 +518,10 @@ class TestBuildTagGroupsWhereClause:
                 }
             )
         ]
-        clause, params, next_offset = build_tag_groups_where_clause(groups, 1)
+        built = build_tag_groups_where_clause(groups, 1)
+        clause = built.sql
+        params = built.params
+        next_offset = built.next_param_offset
         assert "AND" in clause
         assert "OR" in clause
         assert len(params) == 3
@@ -507,7 +540,10 @@ class TestBuildTagGroupsWhereClause:
                 }
             )
         ]
-        clause, params, next_offset = build_tag_groups_where_clause(groups, 5)
+        built = build_tag_groups_where_clause(groups, 5)
+        clause = built.sql
+        params = built.params
+        next_offset = built.next_param_offset
         assert "$5" in clause
         assert "$6" in clause
         assert "$7" in clause
@@ -517,7 +553,10 @@ class TestBuildTagGroupsWhereClause:
     def test_table_alias_applied_to_leaves(self):
         """Table alias is prefixed to column name in all leaf clauses."""
         groups = [TagGroupLeaf(tags=["user:alice"], match="any_strict")]
-        clause, params, next_offset = build_tag_groups_where_clause(groups, 1, table_alias="mu.")
+        built = build_tag_groups_where_clause(groups, 1, table_alias="mu.")
+        clause = built.sql
+        params = built.params
+        next_offset = built.next_param_offset
         assert "mu.tags" in clause
 
     def test_table_alias_propagates_to_nested(self):
@@ -532,7 +571,10 @@ class TestBuildTagGroupsWhereClause:
                 }
             )
         ]
-        clause, params, next_offset = build_tag_groups_where_clause(groups, 1, table_alias="mu.")
+        built = build_tag_groups_where_clause(groups, 1, table_alias="mu.")
+        clause = built.sql
+        params = built.params
+        next_offset = built.next_param_offset
         # Each leaf of type any_strict references mu.tags three times (IS NOT NULL, != '{}', &&)
         # We verify that 'tags' without alias is NOT present, proving the alias is always used
         assert "mu.tags" in clause
@@ -548,7 +590,10 @@ class TestBuildTagGroupsWhereClause:
             TagGroupLeaf(tags=["step:5"], match="any_strict"),
             TagGroupLeaf(tags=["user:ep_42"], match="all_strict"),
         ]
-        clause, params, next_offset = build_tag_groups_where_clause(groups, 1)
+        built = build_tag_groups_where_clause(groups, 1)
+        clause = built.sql
+        params = built.params
+        next_offset = built.next_param_offset
         # Should start with AND and have two param refs joined by AND
         assert clause.startswith("AND ")
         assert " AND " in clause[4:]  # after the leading "AND "
@@ -560,7 +605,10 @@ class TestBuildTagGroupsWhereClause:
     def test_exact_leaf_empty_scope_matches_untagged_only(self):
         """An exact leaf with [] becomes an untagged-only clause with no bind param."""
         groups = [TagGroupLeaf(tags=[], match="exact")]
-        clause, params, next_offset = build_tag_groups_where_clause(groups, 5)
+        built = build_tag_groups_where_clause(groups, 5)
+        clause = built.sql
+        params = built.params
+        next_offset = built.next_param_offset
         assert "IS NULL" in clause
         assert "= '{}'" in clause
         assert "$5" not in clause  # param-free
@@ -724,6 +772,44 @@ class TestFilterResultsByTagGroups:
 # ============================================================================
 # Integration Tests for tags in retain/recall/reflect
 # ============================================================================
+
+
+class TestStrictTagsMatch:
+    """The staleness scope of a tagged mental model drops untagged rows (#4857)."""
+
+    @pytest.mark.parametrize(
+        "match,expected",
+        [
+            ("any", "any_strict"),
+            ("all", "all_strict"),
+            ("any_strict", "any_strict"),
+            ("all_strict", "all_strict"),
+            ("exact", "exact"),
+        ],
+    )
+    def test_strict_tags_match(self, match, expected):
+        assert strict_tags_match(match) == expected
+
+    def test_strict_tag_group_rewrites_every_leaf(self):
+        group = TagGroupAnd(
+            filters=[
+                TagGroupLeaf(tags=["a"], match="any", resolve="fuzzy"),
+                TagGroupOr(filters=[TagGroupLeaf(tags=["b"], match="all"), TagGroupLeaf(tags=[], match="exact")]),
+                TagGroupNot(filter=TagGroupLeaf(tags=["c"], match="any")),
+            ]
+        )
+
+        assert strict_tag_group(group) == TagGroupAnd(
+            filters=[
+                TagGroupLeaf(tags=["a"], match="any_strict", resolve="fuzzy"),
+                TagGroupOr(
+                    filters=[TagGroupLeaf(tags=["b"], match="all_strict"), TagGroupLeaf(tags=[], match="exact")]
+                ),
+                TagGroupNot(filter=TagGroupLeaf(tags=["c"], match="any_strict")),
+            ]
+        )
+        # The input is left alone: the refresh still reads through the original.
+        assert group.filters[0].match == "any"
 
 
 @pytest_asyncio.fixture
@@ -1369,9 +1455,11 @@ async def test_list_tags_pagination(api_client):
 
 
 @pytest.mark.asyncio
-async def test_list_tags_empty_bank(api_client):
+async def test_list_tags_empty_bank(api_client, memory):
     """Test that list_tags returns empty for bank with no tags."""
     bank_id = f"list_tags_empty_test_{datetime.now().timestamp()}"
+    # The bank has to exist: a bank nobody created is a 404, not an empty list (#4175).
+    await memory.ensure_bank_profile(bank_id, request_context=RequestContext())
 
     # List tags without storing anything
     response = await api_client.get(f"/v1/default/banks/{bank_id}/tags")
@@ -1778,7 +1866,7 @@ async def test_tag_groups_nested_and_containing_or(api_client):
 async def _create_mental_model_via_engine(memory, *, bank_id, name, tags, request_context):
     """Helper that creates a mental model directly through the engine without an LLM call."""
     # Ensure the bank exists (mental_models has a FK to banks).
-    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
     return await memory.create_mental_model(
         bank_id=bank_id,
         name=name,

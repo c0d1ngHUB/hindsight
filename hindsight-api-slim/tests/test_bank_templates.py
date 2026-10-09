@@ -1,6 +1,7 @@
 """Integration tests for bank template import/export endpoints."""
 
 from datetime import datetime
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -70,6 +71,29 @@ def sample_template():
 
 class TestImportValidation:
     """Test template manifest validation."""
+
+    def test_import_openapi_declares_manifest_request_body(self):
+        """The import operation publishes its manifest body for generated SDKs."""
+        app = create_app(SimpleNamespace(audit_logger=None), initialize_memory=False)
+        operation = app.openapi()["paths"]["/v1/default/banks/{bank_id}/import"]["post"]
+        request_body = operation["requestBody"]
+        assert request_body["required"] is True
+        assert (
+            request_body["content"]["application/json"]["schema"]["$ref"] == "#/components/schemas/BankTemplateManifest"
+        )
+
+    @pytest.mark.asyncio
+    async def test_import_malformed_json_returns_bad_request(self):
+        """Malformed JSON keeps the endpoint's established 400 response."""
+        app = create_app(SimpleNamespace(audit_logger=None), initialize_memory=False)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/default/banks/malformed-json/import",
+                content=b'{"bank":',
+                headers={"content-type": "application/json"},
+            )
+        assert resp.status_code == 400
 
     @pytest.mark.asyncio
     async def test_import_dry_run_valid(self, api_client, bank_id, sample_template):
@@ -330,6 +354,11 @@ class TestImportApply:
         assert mm["name"] == "Imported Model"
         assert mm["source_query"] == "What patterns exist?"
         assert mm["tags"] == ["imported"]
+        assert not (mm["content"] or "").strip(), (
+            "a page that has not refreshed yet must carry an empty body, not a placeholder "
+            "sentence — the body is embedded and BM25-indexed, so a placeholder makes every "
+            "brand-new page searchable as its own placeholder text"
+        )
 
     @pytest.mark.asyncio
     async def test_import_updates_existing_mental_models(self, api_client, bank_id):
@@ -442,6 +471,47 @@ class TestImportApply:
         directive = [d for d in items if d["name"] == "Reusable Directive"][0]
         assert directive["content"] == "Updated content"
         assert directive["priority"] == 10
+
+    @pytest.mark.asyncio
+    async def test_reimporting_unchanged_manifest_skips_resources(self, api_client, bank_id):
+        """Re-applying the same manifest is a no-op: nothing is updated or refreshed (#5271)."""
+        manifest = {
+            "version": "1",
+            "mental_models": [
+                {
+                    "id": "stable-mm",
+                    "name": "Stable",
+                    "source_query": "What is stable?",
+                    "tags": ["b", "a"],
+                    "max_tokens": 1024,
+                    "trigger": {"mode": "delta", "refresh_after_consolidation": True},
+                },
+                {"id": "other-mm", "name": "Other", "source_query": "What else?"},
+            ],
+            "directives": [
+                {"name": "Stable Directive", "content": "Be precise.", "priority": 3, "tags": ["x"]},
+                {"name": "Other Directive", "content": "Be brief."},
+            ],
+        }
+        first = await api_client.post(f"/v1/default/banks/{bank_id}/import", json=manifest)
+        assert first.status_code == 200, first.text
+
+        again = await api_client.post(f"/v1/default/banks/{bank_id}/import", json=manifest)
+        assert again.status_code == 200, again.text
+        data = again.json()
+        assert data["mental_models_updated"] == []
+        assert data["directives_updated"] == []
+        assert data["operation_ids"] == []
+
+        # A changed resource is still updated, and only that one.
+        manifest["mental_models"][1]["source_query"] = "What changed?"
+        manifest["directives"][1]["is_active"] = False
+        changed = await api_client.post(f"/v1/default/banks/{bank_id}/import", json=manifest)
+        assert changed.status_code == 200, changed.text
+        data = changed.json()
+        assert data["mental_models_updated"] == ["other-mm"]
+        assert data["directives_updated"] == ["Other Directive"]
+        assert len(data["operation_ids"]) == 1
 
     @pytest.mark.asyncio
     async def test_import_config_only(self, api_client, bank_id):
@@ -874,7 +944,6 @@ class TestDefaultBankTemplateEnvVar:
         profile = await memory.get_bank_profile(
             bank_id,
             request_context=RequestContext(),
-            create_if_missing=False,
         )
         assert profile is None
 

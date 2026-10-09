@@ -13,6 +13,8 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
+from ...search.tags import TagGroup, build_tag_groups_where_clause
+
 
 async def consolidation_freshness(*, conn, fq_table: Callable[[str], str], bank_id: str) -> dict[str, Any]:
     """Last consolidation time, the pending / failed fact counts, and the write watermark, in one scan.
@@ -117,7 +119,14 @@ async def document_memory_counts(
 
 
 async def memories_timeseries(
-    *, conn, fq_table: Callable[[str], str], bank_id: str, time_field: str, trunc: str, since: datetime
+    *,
+    conn,
+    fq_table: Callable[[str], str],
+    bank_id: str,
+    time_field: str,
+    trunc: str,
+    since: datetime,
+    tag_groups: list[TagGroup] | None = None,
 ) -> list[dict[str, Any]]:
     """Memories bucketed by ``time_field`` (truncated to ``trunc``) and fact_type.
 
@@ -126,37 +135,77 @@ async def memories_timeseries(
     rows without an event timestamp still appear.
     """
     bucket_expr = time_field if time_field == "created_at" else f"COALESCE({time_field}, created_at)"
+    groups = build_tag_groups_where_clause(tag_groups, 3)
     rows = await conn.fetch(
         f"""
         SELECT date_trunc('{trunc}', {bucket_expr} AT TIME ZONE 'UTC') AS bucket,
                fact_type, COUNT(*) AS count
         FROM {fq_table("memory_units")}
-        WHERE bank_id = $1 AND {bucket_expr} >= $2
+        WHERE bank_id = $1 AND {bucket_expr} >= $2 {groups.sql}
         GROUP BY bucket, fact_type
         ORDER BY bucket
         """,
         bank_id,
         since,
+        *groups.params,
     )
     return [{"bucket": r["bucket"], "fact_type": r["fact_type"], "count": r["count"]} for r in rows]
 
 
-async def observation_scope_counts(*, conn, fq_table: Callable[[str], str], bank_id: str) -> list[dict[str, Any]]:
-    """Observations grouped by scope (their sorted tag set), most-populous first."""
+async def observation_scope_counts(
+    *,
+    conn,
+    fq_table: Callable[[str], str],
+    bank_id: str,
+    limit: int = 100,
+    offset: int = 0,
+    tag_groups: list[TagGroup] | None = None,
+) -> dict[str, Any]:
+    """One page of the bank's observation scope histogram.
+
+    Returns ``{"scopes": [{tags, count}], "total", "limit", "offset"}``. A bank
+    can hold as many distinct scopes as it has distinct tag sets, so the
+    grouping, the ``count DESC, scope ASC`` ordering and the paging all run in
+    SQL — the whole histogram never crosses the wire. ``tag_groups`` (a caller's
+    forced tag scope) keeps only the observations it admits.
+    """
+    groups = build_tag_groups_where_clause(tag_groups, 2)
+    scopes_select = f"""
+        SELECT COALESCE(ARRAY(SELECT unnest(tags) ORDER BY 1), '{{}}'::text[]) AS scope
+        FROM {fq_table("memory_units")}
+        WHERE bank_id = $1 AND fact_type = 'observation' {groups.sql}
+    """
+
+    total_row = await conn.fetchrow(
+        f"""
+        SELECT COUNT(*) AS total
+        FROM (SELECT DISTINCT scope FROM ({scopes_select}) s) d
+        """,
+        bank_id,
+        *groups.params,
+    )
+    total = int(total_row["total"]) if total_row else 0
+
+    limit_idx = groups.next_param_offset
     rows = await conn.fetch(
         f"""
         SELECT scope, COUNT(*) AS count
-        FROM (
-            SELECT COALESCE(ARRAY(SELECT unnest(tags) ORDER BY 1), '{{}}'::text[]) AS scope
-            FROM {fq_table("memory_units")}
-            WHERE bank_id = $1 AND fact_type = 'observation'
-        ) s
+        FROM ({scopes_select}) s
         GROUP BY scope
         ORDER BY count DESC, scope
+        LIMIT ${limit_idx} OFFSET ${limit_idx + 1}
         """,
         bank_id,
+        *groups.params,
+        limit,
+        offset,
     )
-    return [{"tags": list(r["scope"]), "count": r["count"]} for r in rows]
+    return {
+        "scopes": [{"tags": list(r["scope"]), "count": int(r["count"])} for r in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 __all__ = [
