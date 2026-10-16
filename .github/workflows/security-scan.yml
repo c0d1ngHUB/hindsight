@@ -22,6 +22,9 @@ permissions:
 
 jobs:
   scan-published:
+    # No fork release registry is assumed. Fresh-source image scans below remain
+    # enabled on every fork; opt in only after publishing the fork's own images.
+    if: github.repository == 'vectorize-io/hindsight' || vars.ENABLE_FORK_PUBLISHED_SCAN == 'true'
     name: Scan published ${{ matrix.image }} (${{ matrix.platform }})
     runs-on: ubuntu-latest
     timeout-minutes: 20

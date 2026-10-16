@@ -19,6 +19,8 @@ concurrency:
 
 jobs:
   build:
+    # Forks do not inherit the upstream Pages site/environment configuration.
+    if: github.repository == 'vectorize-io/hindsight' || vars.ENABLE_FORK_PAGES == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -42,6 +44,7 @@ jobs:
         with:
           path: hindsight-docs/build
   deploy:
+    if: github.repository == 'vectorize-io/hindsight' || vars.ENABLE_FORK_PAGES == 'true'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

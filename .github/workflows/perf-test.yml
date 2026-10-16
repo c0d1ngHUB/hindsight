@@ -69,6 +69,8 @@ concurrency:
 
 jobs:
   perf-test:
+    # These jobs need upstream provider credentials and publish to its dashboard.
+    if: github.repository == 'vectorize-io/hindsight' || vars.ENABLE_FORK_PERF == 'true'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v6
@@ -145,7 +147,7 @@ jobs:
     # points AMB's `hindsight-http` provider at it — see
     # hindsight-system-evals/README.md. It replaced a second in-repo copy of the
     # same two datasets, which was free to drift from the published ones.
-    if: inputs.amb_skip != true
+    if: (github.repository == 'vectorize-io/hindsight' || vars.ENABLE_FORK_PERF == 'true') && inputs.amb_skip != true
     runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
@@ -254,7 +256,7 @@ jobs:
     # Observation-dedup quality benchmark: ingests a transcript, drains consolidation
     # (serial SyncTaskBackend + embedded pg0 — no external DB / worker), and reports the
     # near-duplicate observation rate. Real LLM via VertexAI, like the other quality jobs.
-    if: inputs.obs_skip != true
+    if: (github.repository == 'vectorize-io/hindsight' || vars.ENABLE_FORK_PERF == 'true') && inputs.obs_skip != true
     runs-on: ubuntu-latest
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
@@ -341,7 +343,7 @@ jobs:
     # same shape as hindsight-system-tests — except the model is REAL, because a
     # quality eval against a stub would score the stub. That also means it needs
     # provider secrets, which is why it lives here and not in the PR workflow.
-    if: inputs.system_evals_skip != true
+    if: (github.repository == 'vectorize-io/hindsight' || vars.ENABLE_FORK_PERF == 'true') && inputs.system_evals_skip != true
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
