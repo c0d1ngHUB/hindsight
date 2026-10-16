@@ -12,6 +12,7 @@ import re
 from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
@@ -3033,12 +3034,12 @@ async def extract_facts_from_contents_batch_api(
     # Step 3: Poll until complete
     import time
 
-    start_time = time.time()
+    start_time = time.perf_counter()
     while True:
         status_info = await batch_impl.get_batch_status(batch_id)
         status = status_info["status"]
 
-        elapsed = time.time() - start_time
+        elapsed = time.perf_counter() - start_time
         logger.info(
             f"Batch {batch_id}: status={status}, "
             f"completed={status_info['request_counts']['completed']}/{status_info['request_counts']['total']}, "
@@ -3346,11 +3347,14 @@ async def extract_facts_from_contents_batch_api(
         # Track token usage
         usage_data = response_body.get("usage", {})
         if usage_data:
-            total_usage = total_usage + TokenUsage(
-                input_tokens=usage_data.get("prompt_tokens", 0),
-                output_tokens=usage_data.get("completion_tokens", 0),
-                total_tokens=usage_data.get("total_tokens", 0),
-            )
+            # Same OpenAI usage block a live call returns, so it is read the same
+            # way: cached prompt tokens and reasoning tokens included.
+            # Imported here: that module loads the openai SDK, which a process
+            # must not pay for at startup unless it actually reads batch results.
+            from ..providers.openai_compatible_llm import visible_token_usage
+
+            usage_obj = json.loads(json.dumps(usage_data), object_hook=lambda d: SimpleNamespace(**d))
+            total_usage = total_usage + visible_token_usage(SimpleNamespace(usage=usage_obj))
 
     # Step 6: Convert to ExtractedFact objects with proper chunk mapping
     # Group facts by chunk
