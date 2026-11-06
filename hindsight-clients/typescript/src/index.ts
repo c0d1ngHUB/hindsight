@@ -55,6 +55,7 @@ import type {
   TagGroupOrInput,
   TagGroupNotInput,
   MinScores,
+  RerankOptions,
   TemporalWindow,
   AsyncOperationSubmitResponse,
   CreateKnowledgePageResponse,
@@ -62,6 +63,7 @@ import type {
   Base64AttachmentSource,
   DirectiveListResponse,
   DirectiveResponse,
+  DocumentHistoryResponse,
   DocumentResponse,
   DryRunExtractRequest,
   DryRunExtractionResult,
@@ -565,6 +567,8 @@ export class HindsightClient {
       types?: string[];
       /** When recalling raw facts ('world'/'experience') together with 'observation', drop any raw fact a returned observation was consolidated from, so the observation supersedes it (no duplicate content). No effect unless 'observation' and at least one raw type are both in types. Omitted: the bank's recall_prefer_observations config decides (false unless configured). */
       preferObservations?: boolean;
+      /** What a decision model set up for recall does beyond ordering: `prune` drops the results it judges no help instead of only ranking them last; `dedup` drops a result repeating a better-ranked one, at the cost of one more decision-model request. A field left out uses the bank's recall_decision_model_prune / recall_decision_model_dedup config (false unless configured). */
+      rerank?: RerankOptions;
       maxTokens?: number;
       budget?: Budget;
       trace?: boolean;
@@ -599,6 +603,7 @@ export class HindsightClient {
             query,
             types: options?.types,
             prefer_observations: options?.preferObservations,
+            rerank: options?.rerank,
             max_tokens: options?.maxTokens,
             budget: options?.budget || "mid",
             trace: options?.trace,
@@ -662,6 +667,8 @@ export class HindsightClient {
       reflectSearchObservationsMaxTokens?: number;
       /** Whether search_observations attaches resolved entity names, which can be over half the tool payload. Omit to use the bank default (enabled). */
       reflectSearchObservationsIncludeEntities?: boolean;
+      /** Token budget for the mental models the agent's search_mental_models calls return in full (the best-ranked one is always in full; the rest that do not fit come back as a snippet). Omit to use the bank's reflect_default_options, then the shipped default. */
+      reflectSearchMentalModelsMaxTokens?: number;
       /** If true, the response includes a 'based_on' field listing the memories, mental models, and directives used. */
       includeFacts?: boolean;
       /** If true, the response includes a 'trace' field with the tool calls and LLM calls made during reflection (trace.tool_calls / trace.llm_calls). */
@@ -700,6 +707,7 @@ export class HindsightClient {
             reflect_search_observations_max_tokens: options?.reflectSearchObservationsMaxTokens,
             reflect_search_observations_include_entities:
               options?.reflectSearchObservationsIncludeEntities,
+            reflect_search_mental_models_max_tokens: options?.reflectSearchMentalModelsMaxTokens,
             include,
           },
           signal: options?.signal,
@@ -954,14 +962,23 @@ export class HindsightClient {
       retainChunkBatchSize?: number;
       /** Persist the original document text alongside extracted facts. */
       storeDocumentText?: boolean;
+      /** IANA zone (e.g. "Europe/Rome") a retain time with no UTC offset is read in. */
+      defaultTimezone?: string;
       /** Cap on observations retained per scope (-1 for unlimited). */
       maxObservationsPerScope?: number;
       /** Per-scope observation caps, overriding maxObservationsPerScope. */
       observationScopeLimits?: Record<string, unknown>[];
       consolidationStrategies?: Record<string, unknown>[];
+      /** observation_scopes for retained items that send none ("combined" when unset); e.g. [["topic:*"]]. */
+      defaultObservationScopes?:
+        | "combined"
+        | "per_tag"
+        | "all_combinations"
+        | "shared"
+        | string[][];
       /** Consolidate automatically after retain() rather than on demand. */
       enableAutoConsolidation?: boolean;
-      /** When the server has a decision model, let it settle restatements, new facts and chatter before the consolidation LLM call. */
+      /** When the server has a decision model, let it settle restatements and chatter before the consolidation LLM call. */
       consolidationUseDecisionModel?: boolean;
       /** Number of LLM calls to batch during consolidation. */
       consolidationLlmBatchSize?: number;
@@ -977,12 +994,14 @@ export class HindsightClient {
       mentalModelMinRefreshIntervalSeconds?: number;
       /** Trigger fields merged over the built-in default for new knowledge pages. */
       knowledgePageDefaultTrigger?: Record<string, unknown>;
-      /** Default reflect options for this bank, applied whenever a reflect request (or a mental model's trigger) leaves the option unset: reflect_search_observations_max_tokens, reflect_search_observations_include_entities. */
+      /** Default reflect options for this bank, applied whenever a reflect request leaves the option unset (mental-model refreshes use their trigger instead): reflect_search_observations_max_tokens, reflect_search_observations_include_entities, reflect_search_mental_models_max_tokens. */
       reflectDefaultOptions?: Record<string, unknown>;
       /** When the server has a decision model, reflect lets it prune the evidence and decide when to stop (fewer LLM calls). False keeps agent turns. */
       reflectUseDecisionModel?: boolean;
       /** The same, for knowledge-page refreshes. */
       mentalModelRefreshUseDecisionModel?: boolean;
+      /** When the server has a decision model, a delta knowledge-page refresh asks it which new memories could change the page instead of running reflect. */
+      mentalModelDeltaUseDecisionModel?: boolean;
       /** Token budget for source facts during reflect. -1 disables. */
       reflectSourceFactsMaxTokens?: number;
       /** Token budget for facts returned by recall. */
@@ -991,6 +1010,10 @@ export class HindsightClient {
       recallIncludeChunks?: boolean;
       /** Default prefer_observations for recall requests that omit it. */
       recallPreferObservations?: boolean;
+      /** Default prune for recall requests that omit it. */
+      recallDecisionModelPrune?: boolean;
+      /** Default dedup for recall requests that omit it. */
+      recallDecisionModelDedup?: boolean;
       /** Token budget for those chunks. */
       recallChunksMaxTokens?: number;
       /** How the per-query result budget is derived: 'fixed' or 'adaptive'. */
@@ -1062,12 +1085,15 @@ export class HindsightClient {
       updates.retain_chunk_batch_size = options.retainChunkBatchSize;
     if (options.storeDocumentText !== undefined)
       updates.store_document_text = options.storeDocumentText;
+    if (options.defaultTimezone !== undefined) updates.default_timezone = options.defaultTimezone;
     if (options.maxObservationsPerScope !== undefined)
       updates.max_observations_per_scope = options.maxObservationsPerScope;
     if (options.observationScopeLimits !== undefined)
       updates.observation_scope_limits = options.observationScopeLimits;
     if (options.consolidationStrategies !== undefined)
       updates.consolidation_strategies = options.consolidationStrategies;
+    if (options.defaultObservationScopes !== undefined)
+      updates.default_observation_scopes = options.defaultObservationScopes;
     if (options.enableAutoConsolidation !== undefined)
       updates.enable_auto_consolidation = options.enableAutoConsolidation;
     if (options.consolidationUseDecisionModel !== undefined)
@@ -1094,6 +1120,8 @@ export class HindsightClient {
       updates.reflect_use_decision_model = options.reflectUseDecisionModel;
     if (options.mentalModelRefreshUseDecisionModel !== undefined)
       updates.mental_model_refresh_use_decision_model = options.mentalModelRefreshUseDecisionModel;
+    if (options.mentalModelDeltaUseDecisionModel !== undefined)
+      updates.mental_model_delta_use_decision_model = options.mentalModelDeltaUseDecisionModel;
     if (options.reflectSourceFactsMaxTokens !== undefined)
       updates.reflect_source_facts_max_tokens = options.reflectSourceFactsMaxTokens;
     if (options.recallMaxTokens !== undefined) updates.recall_max_tokens = options.recallMaxTokens;
@@ -1101,6 +1129,10 @@ export class HindsightClient {
       updates.recall_include_chunks = options.recallIncludeChunks;
     if (options.recallPreferObservations !== undefined)
       updates.recall_prefer_observations = options.recallPreferObservations;
+    if (options.recallDecisionModelPrune !== undefined)
+      updates.recall_decision_model_prune = options.recallDecisionModelPrune;
+    if (options.recallDecisionModelDedup !== undefined)
+      updates.recall_decision_model_dedup = options.recallDecisionModelDedup;
     if (options.recallChunksMaxTokens !== undefined)
       updates.recall_chunks_max_tokens = options.recallChunksMaxTokens;
     if (options.recallBudgetFunction !== undefined)
@@ -1335,6 +1367,8 @@ export class HindsightClient {
       detail?: "metadata" | "content" | "full";
       limit?: number;
       offset?: number;
+      /** Leave out the models that hold knowledge page content (standalone models only). */
+      excludeKnowledgePages?: boolean;
       signal?: AbortSignal;
     }
   ): Promise<MentalModelListResponse> {
@@ -1347,6 +1381,9 @@ export class HindsightClient {
         ...(options?.detail !== undefined ? { detail: options.detail } : {}),
         ...(options?.limit !== undefined ? { limit: options.limit } : {}),
         ...(options?.offset !== undefined ? { offset: options.offset } : {}),
+        ...(options?.excludeKnowledgePages !== undefined
+          ? { exclude_knowledge_pages: options.excludeKnowledgePages }
+          : {}),
       },
       signal: options?.signal,
     });
@@ -1718,6 +1755,30 @@ export class HindsightClient {
     }
 
     return this.validateResponse(response, "getDocument");
+  }
+
+  /**
+   * What each change did to a document's facts and observations, newest first. Rebuilt from the
+   * bank's operations: `limit`/`offset` count operations, and changes that ran without one (a
+   * synchronous retain) are not listed. Returns null if the document is outside the caller's scope.
+   */
+  async getDocumentHistory(
+    bankId: string,
+    documentId: string,
+    options?: { limit?: number; offset?: number; signal?: AbortSignal }
+  ): Promise<DocumentHistoryResponse | null> {
+    const response = await sdk.getDocumentHistory({
+      client: this.client,
+      path: { bank_id: bankId, document_id: documentId },
+      query: { limit: options?.limit, offset: options?.offset },
+      signal: options?.signal,
+    });
+
+    if ((response as any).response?.status === 404) {
+      return null;
+    }
+
+    return this.validateResponse(response, "getDocumentHistory");
   }
 
   /**
@@ -2121,12 +2182,14 @@ export type {
   TagGroupOrInput,
   TagGroupNotInput,
   MinScores,
+  RerankOptions,
   TemporalWindow,
   AsyncOperationSubmitResponse,
   CreateKnowledgePageResponse,
   CreateMentalModelResponse,
   DirectiveListResponse,
   DirectiveResponse,
+  DocumentHistoryResponse,
   DocumentResponse,
   DryRunExtractRequest,
   DryRunExtractionResult,

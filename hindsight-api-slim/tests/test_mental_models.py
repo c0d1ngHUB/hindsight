@@ -10,14 +10,14 @@ from datetime import datetime, timezone
 
 import pytest
 
+from hindsight_api.engine.memories import MemoryScopeWatermark
 from hindsight_api.engine.memory_engine import (
     MemoryEngine,
-    _MentalModelScopeWatermark,
     _mental_model_stale_scope_from_row,
+    _MentalModelScopeWatermark,
 )
-from hindsight_api.engine.schema import fq_store_table
-from hindsight_api.engine.memories import MemoryScopeWatermark
 from hindsight_api.engine.retain import embedding_utils
+from hindsight_api.engine.schema import fq_store_table
 from tests.llm_judge import assert_meets_criteria, evaluate
 
 
@@ -1565,6 +1565,92 @@ class TestMentalModelStaleness:
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.memory_backend_incompatible
+    @pytest.mark.parametrize("tags_match", ["all_strict", "any"])
+    async def test_pages_sharing_a_filter_each_keep_their_own_cutoff(
+        self, memory: MemoryEngine, request_context, tags_match
+    ):
+        """Pages with the same filter are asked once, but answered per cutoff (#6325).
+
+        The batch looks up the filter's newest write once and compares every page's
+        cutoff against it. Pinned in both query shapes — the tag-index aggregate
+        (``all_strict``) and the time-ordered walk (``any``) — with cutoffs before,
+        at and after that write, tags listed in a different order (still the same
+        filter), and a fact-type filter that must not be folded into the others.
+        """
+        from datetime import timedelta
+
+        from hindsight_api.engine.memories import get_memories
+
+        bank_id = f"test-mm-shared-filter-{uuid.uuid4().hex[:8]}"
+        await memory.ensure_bank_profile(bank_id, request_context=request_context)
+        await self._insert_memory(memory, bank_id, tags=["user_a", "team_red"], fact_type="experience")
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            # Read straight from the table, like `_insert_memory` writes to it: the
+            # cutoffs are placed around the store's own `updated_at`, the internal
+            # column the staleness check compares against, and the "at" case needs
+            # it exactly.
+            written = await conn.fetchval(
+                f"SELECT max(updated_at) FROM {fq_store_table('memory_units')} WHERE bank_id = $1", bank_id
+            )
+            cutoffs = {
+                "before": written - timedelta(seconds=1),
+                "at": written,
+                "after": written + timedelta(seconds=1),
+            }
+            scopes = [
+                MemoryScopeWatermark(
+                    key=f"{name}-{order}",
+                    since=since,
+                    tags=tags,
+                    tags_match=tags_match,
+                    fact_types=None,
+                )
+                for name, since in cutoffs.items()
+                for order, tags in (("ab", ["user_a", "team_red"]), ("ba", ["team_red", "user_a"]))
+            ]
+            scopes.append(
+                MemoryScopeWatermark(
+                    key="other-fact-type",
+                    since=cutoffs["before"],
+                    tags=["user_a", "team_red"],
+                    tags_match=tags_match,
+                    fact_types=["world"],
+                )
+            )
+            store = get_memories()
+            batch = await store.any_memory_updated_since_batch(
+                conn=conn, fq_table=fq_store_table, bank_id=bank_id, scopes=scopes
+            )
+            single = {
+                scope.key: await store.any_memory_updated_since(
+                    conn=conn,
+                    fq_table=fq_store_table,
+                    bank_id=bank_id,
+                    since=scope.since,
+                    tags=scope.tags,
+                    tags_match=scope.tags_match,
+                    fact_types=scope.fact_types,
+                )
+                for scope in scopes
+            }
+
+        assert (
+            batch
+            == single
+            == {
+                "before-ab": True,
+                "before-ba": True,
+                "at-ab": False,
+                "at-ba": False,
+                "after-ab": False,
+                "after-ba": False,
+                "other-fact-type": False,
+            }
+        )
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.memory_backend_incompatible
     async def test_flat_tags_and_fact_types_share_stale_scope(self, memory: MemoryEngine, request_context):
         bank_id = f"test-mm-stale-flat-fact-{uuid.uuid4().hex[:8]}"
         await memory.ensure_bank_profile(bank_id, request_context=request_context)
@@ -2925,33 +3011,33 @@ class TestMentalModelTriggerSchema:
     """Unit tests for MentalModelTrigger schema validation (no DB needed)."""
 
     def test_trigger_accepts_tags_match(self):
-        from hindsight_api.api.http import MentalModelTrigger
+        from hindsight_api.engine.response_models import MentalModelTrigger
 
         t = MentalModelTrigger(tags_match="any")
         assert t.tags_match == "any"
 
     def test_trigger_accepts_all_tags_match_modes(self):
-        from hindsight_api.api.http import MentalModelTrigger
+        from hindsight_api.engine.response_models import MentalModelTrigger
 
         for mode in ("any", "all", "any_strict", "all_strict"):
             t = MentalModelTrigger(tags_match=mode)
             assert t.tags_match == mode
 
     def test_trigger_tags_match_defaults_to_none(self):
-        from hindsight_api.api.http import MentalModelTrigger
+        from hindsight_api.engine.response_models import MentalModelTrigger
 
         t = MentalModelTrigger()
         assert t.tags_match is None
 
     def test_trigger_accepts_tag_groups_leaf(self):
-        from hindsight_api.api.http import MentalModelTrigger
+        from hindsight_api.engine.response_models import MentalModelTrigger
 
         t = MentalModelTrigger(tag_groups=[{"tags": ["user:alice"], "match": "all_strict"}])
         assert len(t.tag_groups) == 1
         assert t.tag_groups[0].tags == ["user:alice"]
 
     def test_trigger_accepts_tag_groups_compound(self):
-        from hindsight_api.api.http import MentalModelTrigger
+        from hindsight_api.engine.response_models import MentalModelTrigger
 
         t = MentalModelTrigger(
             tag_groups=[
@@ -2970,14 +3056,14 @@ class TestMentalModelTriggerSchema:
         assert len(t.tag_groups[0].filters) == 2
 
     def test_trigger_tag_groups_defaults_to_none(self):
-        from hindsight_api.api.http import MentalModelTrigger
+        from hindsight_api.engine.response_models import MentalModelTrigger
 
         t = MentalModelTrigger()
         assert t.tag_groups is None
 
     def test_trigger_roundtrip_via_model_dump(self):
         """Test that tag_groups survive model_dump -> model_validate (simulates DB storage)."""
-        from hindsight_api.api.http import MentalModelTrigger
+        from hindsight_api.engine.response_models import MentalModelTrigger
 
         t = MentalModelTrigger(
             tags_match="any",
@@ -2994,7 +3080,7 @@ class TestMentalModelTriggerSchema:
     def test_trigger_tag_groups_rejects_invalid(self):
         from pydantic import ValidationError
 
-        from hindsight_api.api.http import MentalModelTrigger
+        from hindsight_api.engine.response_models import MentalModelTrigger
 
         with pytest.raises(ValidationError):
             MentalModelTrigger(tag_groups=[{"invalid_key": "bad"}])
@@ -3617,6 +3703,123 @@ class TestRefreshSkipsEmptyScope:
             bank_id=bank_id, mental_model_id=closed_mm["id"], request_context=request_context
         )
         assert calls == [], "exclude_mental_models closes the only door left — nothing to read"
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    async def test_siblings_do_not_rewrite_a_document_whose_memory_scope_is_empty(
+        self, memory: MemoryEngine, request_context
+    ):
+        """#5728: a document built from memories, whose memory scope is now empty, must
+        not be rewritten from sibling pages. Reflect over pages that do not cover its
+        topic writes a "no records" report over the real content."""
+        bank_id = f"test-mm-sibling-keep-{uuid.uuid4().hex[:8]}"
+        await memory.ensure_bank_profile(bank_id, request_context=request_context)
+        await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Architecture",
+            source_query="How is the system built?",
+            content="# Architecture\n\nA monorepo with an API and a control plane.",
+            request_context=request_context,
+        )
+        existing = "# Current State\n\nShipping the billing rewrite this week."
+        mm = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Current State",
+            source_query="What is the team working on?",
+            content=existing,
+            trigger={"exclude_mental_models": False},
+            request_context=request_context,
+        )
+        # A refresh that read memories stamped this: the content came from them.
+        await memory.update_mental_model(
+            bank_id=bank_id,
+            mental_model_id=mm["id"],
+            refresh_watermark=datetime.now(timezone.utc),
+            refresh_completed=True,
+            request_context=request_context,
+        )
+        calls = self._stub_reflect(memory)
+
+        refreshed = await memory.refresh_mental_model(
+            bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
+        )
+
+        assert calls == [], "pages alone replaced a document built from memories (#5728)"
+        assert refreshed is not None
+        assert refreshed["content"].strip() == existing
+        assert refreshed["reflect_response"]["reflect_skipped"] == "no_sources_in_scope"
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    async def test_a_document_written_from_pages_keeps_refreshing_from_them(
+        self, memory: MemoryEngine, request_context
+    ):
+        """The other half of #5728: a model composed from sibling pages has no memory
+        scope to lose, so pages stay its source after its first write."""
+        bank_id = f"test-mm-sibling-composed-{uuid.uuid4().hex[:8]}"
+        await memory.ensure_bank_profile(bank_id, request_context=request_context)
+        await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Architecture",
+            source_query="How is the system built?",
+            content="# Architecture\n\nA monorepo with an API and a control plane.",
+            request_context=request_context,
+        )
+        # Content, but never a refresh with memories in scope: written from pages.
+        mm = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Overview",
+            source_query="Summarise the other pages.",
+            content="# Overview\n\nSee Architecture.",
+            trigger={"exclude_mental_models": False},
+            request_context=request_context,
+        )
+        calls = self._stub_reflect(memory)
+
+        await memory.refresh_mental_model(bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context)
+
+        assert len(calls) == 1, "a document written from pages alone must still refresh from them"
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    async def test_siblings_the_agent_cannot_read_are_not_sources(self, memory: MemoryEngine, request_context):
+        """A sibling outside the model's tag scope, or in its exclude list, is never
+        returned by ``search_mental_models`` — so it is not something to reflect over."""
+        bank_id = f"test-mm-sibling-scope-{uuid.uuid4().hex[:8]}"
+        await memory.ensure_bank_profile(bank_id, request_context=request_context)
+        sibling = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Architecture",
+            source_query="How is the system built?",
+            content="# Architecture\n\nA monorepo with an API and a control plane.",
+            tags=["backend"],
+            request_context=request_context,
+        )
+        out_of_scope = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Design System",
+            source_query="How is the design system organised?",
+            content="",
+            tags=["design-system"],
+            trigger={"tags_match": "all_strict", "exclude_mental_models": False},
+            request_context=request_context,
+        )
+        excluded = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Onboarding",
+            source_query="What should a new engineer read first?",
+            content="",
+            trigger={"exclude_mental_models": False, "exclude_mental_model_ids": [sibling["id"]]},
+            request_context=request_context,
+        )
+        calls = self._stub_reflect(memory)
+
+        for mm in (out_of_scope, excluded):
+            await memory.refresh_mental_model(
+                bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context
+            )
+
+        assert calls == [], "the only sibling is one this model's page search can never return"
 
         await memory.delete_bank(bank_id, request_context=request_context)
 

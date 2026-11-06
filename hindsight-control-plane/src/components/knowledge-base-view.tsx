@@ -69,6 +69,11 @@ import { buildPathIndex } from "@/lib/knowledge-path";
 import { isTagFilterActive } from "@/lib/tag-filter-params";
 import { downloadMarkdown, printPage } from "@/lib/page-download";
 import { UpdateMentalModelDialog } from "./mental-models-view";
+import {
+  AttachmentStrip,
+  attachmentUrl,
+  type RetainedAttachment,
+} from "@/components/ui/inline-attachment-text";
 
 type PageDetail = Awaited<ReturnType<typeof client.getKnowledgePage>>;
 
@@ -151,6 +156,9 @@ export function KnowledgeBaseView() {
   // Provenance: how many source memories grounded the open page's last synthesis.
   // Derived from the backing mental model's reflect_response (not the page endpoint).
   const [supportingCount, setSupportingCount] = useState(0);
+  // Images behind the page's evidence, deduplicated: several facts from one
+  // screenshot all carry it, and the page shows it once.
+  const [pageAttachments, setPageAttachments] = useState<RetainedAttachment[]>([]);
   const [selectedMmId, setSelectedMmId] = useState<string | null>(null);
   // Non-null while the provenance dialog (the backing model's based_on) is open.
   const [provenanceMmId, setProvenanceMmId] = useState<string | null>(null);
@@ -323,27 +331,39 @@ export function KnowledgeBaseView() {
   useEffect(() => {
     if (!selected || !currentBank) {
       setSupportingCount(0);
+      setPageAttachments([]);
       return;
     }
     const mmId = allNodes.find((n) => n.id === selected.id)?.mental_model_id;
     setSelectedMmId(mmId ?? null);
     if (!mmId) {
       setSupportingCount(0);
+      setPageAttachments([]);
       return;
     }
     let cancelled = false;
+    // Clear now, not on arrival: until this page's evidence loads, the strip
+    // would otherwise keep showing the previous page's images.
+    setPageAttachments([]);
     client
       .getMentalModel(currentBank, mmId)
       .then((mm) => {
         if (cancelled) return;
         const basedOn = mm.reflect_response?.based_on ?? {};
-        const count = (["world", "experience", "observation"] as const).reduce(
-          (sum, ft) => sum + (basedOn[ft]?.length ?? 0),
-          0
+        const facts = (["world", "experience", "observation"] as const).flatMap(
+          (ft) => basedOn[ft] ?? []
         );
-        setSupportingCount(count);
+        setSupportingCount(facts.length);
+        const byId = new Map<string, RetainedAttachment>();
+        for (const fact of facts) {
+          for (const attachment of fact.attachments ?? []) byId.set(attachment.id, attachment);
+        }
+        setPageAttachments([...byId.values()]);
       })
-      .catch(() => setSupportingCount(0));
+      .catch(() => {
+        setSupportingCount(0);
+        setPageAttachments([]);
+      });
     return () => {
       cancelled = true;
     };
@@ -517,9 +537,10 @@ export function KnowledgeBaseView() {
 
   return (
     <div>
-      {/* Obsidian-style workspace: one frame, a file-explorer sidebar + editor pane. */}
-      <div className="flex items-stretch overflow-hidden h-[calc(100vh-13rem)] min-h-[520px]">
-        <aside className="w-1/3 flex-shrink-0 bg-muted/30 border-r border-border flex flex-col">
+      {/* Obsidian-style workspace: one frame, a file-explorer sidebar + editor pane.
+          On phones the explorer stacks above the page instead of squeezing beside it. */}
+      <div className="flex flex-col md:flex-row items-stretch overflow-hidden h-[calc(100dvh-13rem)] min-h-[520px]">
+        <aside className="w-full max-h-[45%] md:w-1/3 md:max-h-none flex-shrink-0 bg-muted/30 border-b md:border-b-0 md:border-r border-border flex flex-col">
           {/* One box for both filters: free text runs the hybrid search, `#tag` tokens
               become chips that filter the tree and the search alike. The sliders open
               the same filter against the raw endpoints. */}
@@ -580,6 +601,7 @@ export function KnowledgeBaseView() {
               onTagFilterChange={setTagFilter}
               pathById={pathById}
               onOpenPage={openPage}
+              initialMentalModelId={selectedMmId}
             />
           )}
 
@@ -675,9 +697,11 @@ export function KnowledgeBaseView() {
               <Spinner size="lg" variant="jump" />
             </div>
           ) : selected ? (
-            <div className="p-8 max-w-3xl mx-auto">
-              <div className="flex items-start justify-between gap-3">
-                <h1 className="text-2xl font-bold text-foreground">{selected.name}</h1>
+            <div className="p-4 sm:p-8 max-w-3xl mx-auto">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <h1 className="min-w-0 break-words text-2xl font-bold text-foreground">
+                  {selected.name}
+                </h1>
                 <div className="flex gap-2 shrink-0">
                   {selected.body && (
                     <DropdownMenu>
@@ -695,6 +719,14 @@ export function KnowledgeBaseView() {
                               body: selected.body ?? "",
                               updatedAt: selected.timestamp,
                               tags: selected.tags,
+                              images: currentBank
+                                ? {
+                                    label: t("evidenceImages"),
+                                    urls: pageAttachments
+                                      .filter((a) => a.media_type?.startsWith("image/"))
+                                      .map((a) => attachmentUrl(currentBank, a)),
+                                  }
+                                : undefined,
                             })
                           }
                         >
@@ -794,6 +826,15 @@ export function KnowledgeBaseView() {
                 <p className="text-sm text-muted-foreground italic border-t border-border mt-5 pt-5">
                   {t("noBody")}
                 </p>
+              )}
+
+              {pageAttachments.length > 0 && currentBank && (
+                <section className="border-t border-border mt-5 pt-4">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-2">
+                    {t("evidenceImages")}
+                  </h3>
+                  <AttachmentStrip bankId={currentBank} attachments={pageAttachments} />
+                </section>
               )}
             </div>
           ) : (

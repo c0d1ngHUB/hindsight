@@ -117,7 +117,7 @@ fmt.Printf("Operation ID: %s\n", result.GetOperationId())
 |-----------|------|----------|-------------|
 | `name` | string | Yes | Human-readable name for the mental model |
 | `source_query` | string | Yes | The query to run to generate content |
-| `id` | string | No | Custom ID for the mental model (alphanumeric lowercase with hyphens). Auto-generated if omitted. |
+| `id` | string | No | Custom ID for the mental model (same rules as a bank id: at most 192 bytes of UTF-8, no '/' and no control characters). Auto-generated if omitted. |
 | `tags` | list | No | Tags that scope the model during reflect **and** filter source memories during refresh. Defaults to `all_strict` matching, so only memories carrying every listed tag are read. See [Tags and Visibility](#tags-and-visibility). |
 | `max_tokens` | int | No | Maximum tokens for the mental model content |
 | `trigger` | object | No | Trigger settings (see [Automatic Refresh](#automatic-refresh)) |
@@ -221,6 +221,8 @@ When `refresh_cron` is set, Hindsight checks the schedule on the server's mental
 
 **A failed refresh pauses the automatic ones.** A failed refresh is retried by the worker (`HINDSIGHT_API_WORKER_MAX_RETRIES`, 3 by default) and then stops. None of `refresh_after_consolidation`, `refresh_cron` or `full_refresh_cron` queues that model again until a refresh succeeds, so a refresh that cannot work (a prompt too large for the model, an empty account, a delta that will not apply) costs a few attempts instead of an LLM bill every tick. The failure shows in the model's [history](#history). Fix the cause and refresh the model yourself: a successful refresh resumes the automatic ones. A refresh cut off by `HINDSIGHT_API_REFLECT_WALL_TIMEOUT`, which bounds a whole refresh the same way it bounds a reflect, counts as a failure too.
 
+To catch a paused model without opening it, watch `paused_mental_models` on bank stats (`GET /v1/default/banks/{bank_id}/stats`): it counts the models in the bank that are paused right now, so an alert on it being above 0 tells you a page has stopped updating.
+
 ### Rate-limiting automatic refreshes
 
 A refresh is a full reflect run: retrieval plus an agentic LLM loop. With
@@ -305,7 +307,7 @@ Listing does not cost one query per model — the whole page is answered togethe
 - **Only what's new, in `delta` mode.** A delta refresh scopes its retrieval to memories created since the last refresh, so the LLM reads genuinely new information rather than re-reading the whole bank.
 - **Cumulative grounding.** Even in delta mode, `reflect_response.based_on` accumulates: the facts from this refresh are merged with everything previous refreshes relied on, deduplicated by id. The document rests on all of them, not just the latest slice.
 - **Nothing, if nothing is relevant.** A refresh that finds no topic-relevant memories leaves the content alone and only advances the watermark, so the same empty window stops re-triggering.
-- **No LLM call at all, if there is nothing to read.** Before the agentic loop starts, a refresh checks whether anything is in reach under this model's own settings: an in-scope memory (`tags`/`tags_match`, `tag_groups` and `fact_types` all narrow it) inside the window it would read — the whole bank in `full` mode, everything since `last_memory_seen_at` in `delta` mode — or a sibling mental model, unless `exclude_mental_models` closed that door. When there is nothing, the refresh completes immediately, leaves the document untouched, and spends nothing. This is the common case on a bank that was just created: its pages are refreshed the moment they exist, before anything has been retained.
+- **No LLM call at all, if there is nothing to read.** Before the agentic loop starts, a refresh checks whether anything is in reach under this model's own settings: an in-scope memory (`tags`/`tags_match`, `tag_groups` and `fact_types` all narrow it) inside the window it would read — the whole bank in `full` mode, everything since `last_memory_seen_at` in `delta` mode — or a sibling mental model this refresh could read (same tags, not in `exclude_mental_model_ids`), unless `exclude_mental_models` closed that door. Sibling models alone only count for a document that has nothing to lose — an empty one, or one no refresh has ever written with memories in scope: a document built from memories is never rewritten from sibling models once its own memory scope comes up empty. When there is nothing, the refresh completes immediately, leaves the document untouched, and spends nothing. This is the common case on a bank that was just created: its pages are refreshed the moment they exist, before anything has been retained.
 - **A failed retrieval is not an empty one.** If a retrieval step raises — the database, the embedder or the reranker is unavailable — the refresh **fails** instead of writing what the model came up with without it. Content, `structured_output` and the watermark are all left untouched, so the retry reads the same window again. This is the distinction that matters: "we looked and there is nothing on this topic" is an answer and gets written; "we could not look" is a failure and gets preserved. Without it, a broken retriever silently replaced a document built over months with a generic "I don't have information about that".
 
 ### Refresh Mode
@@ -354,6 +356,8 @@ Delta mode falls back to a full regeneration automatically in two cases:
 2. The `source_query` has changed since the last refresh (the topic has shifted; the existing structure may no longer apply).
 
 **A delta refresh never replaces the document with a partial one.** Because delta retrieval only reads memories newer than the last refresh, an answer written from that window covers just the recent slice of the topic — it is material for editing the document, not a replacement for it. So when the edits can't be made at all — the provider call fails, the response can't be read, or every single operation is rejected — the existing content stays exactly as it is and the refresh **fails** instead of completing. Nothing is lost, the refresh's time window is not advanced, and a retry sees the same memories again. The same holds for an empty answer: a populated document is never overwritten with an empty one. A delta refresh is never turned into a full rewrite behind your back: if a model's delta refreshes keep failing, switch its `mode` to `full`.
+
+**With a decision model, a delta refresh can skip reflect.** When a [decision model](../decision-models.md) is set up for reflect, a delta refresh asks it which memories added since the last refresh could change the document, and sends only those to the LLM that writes the operations — none of them means no LLM call. See [Knowledge Pages](../knowledge-pages.md#decision-model-refresh) for limits and fallbacks.
 
 | Use Case | Recommended Mode | Why |
 |----------|-----------------|-----|
@@ -511,6 +515,8 @@ for _, mm := range mentalModels.GetItems() {
 	fmt.Printf("- %s: %s\n", mm.GetName(), mm.GetSourceQuery())
 }
 ```
+
+A [knowledge page](./knowledge-pages.md) keeps its content in a mental model, so the list includes the models behind pages too. Each item carries `is_knowledge_page` to tell them apart, and `exclude_knowledge_pages=true` lists standalone mental models only (both the items and `total`).
 
 ---
 
@@ -919,7 +925,7 @@ somewhere else.
 |-------|----------|
 | `effective_mode` | Whether the run ended up `full` or `delta` |
 | `mode_fallback_reason` | Why delta was requested but not applied — `no_baseline_content`, `source_query_changed`, `structured_doc_unreadable`, `delta_ops_failed`, `delta_ops_all_skipped` |
-| `outcome` | `content_written`, `content_preserved_no_new_facts`, `refresh_failed_empty_candidate`, or `refresh_failed_delta_not_applied` (the edits didn't apply, so the document was kept and the refresh failed). The operation record adds two the executor cannot produce, because they happen outside a run: `refresh_failed_structured_output` and `refresh_failed_error` (a retrieval tool raised, the agent produced no answer, or something unforeseen escaped the refresh) |
+| `outcome` | `content_written`, `content_preserved_no_new_facts`, `refresh_failed_empty_candidate`, or `refresh_failed_delta_not_applied` (the edits didn't apply, so the document was kept and the refresh failed). The operation record adds three the executor cannot produce, because they happen outside a run: `refresh_failed_structured_output`, `refresh_failed_candidate_rejected` (an [operation validator](../extensions.md) rejected the new document) and `refresh_failed_error` (a retrieval tool raised, the agent produced no answer, or something unforeseen escaped the refresh) |
 | `tool_calls[]` | Per call: `tool`, the agent's `reason`, the full `input`, `result_count`, `duration_ms`, and the `iteration` it belongs to |
 | `llm_calls[]` | Per call: `scope` (`agent_1`, `agent_2`, …, `final`) and `duration_ms` |
 | `delta_operations` | The operations emitted in delta mode, `applied` and `skipped` |
@@ -1287,7 +1293,7 @@ The endpoint returns a list of history entries, most recent first:
 | `changed_at` | string | ISO 8601 timestamp of when the change occurred |
 | `kind` | `"refresh_failed"` \| absent | Present only on a **failure record** — a refresh that refused to write. Absent on version snapshots |
 | `outcome` | string \| absent | On a failure record: the operation outcome, e.g. `refresh_failed_error` |
-| `failure_reason` | string \| absent | On a failure record: why it refused — `retrieval_failed`, `no_answer`, `unexpected_error`, `empty_candidate`, `structured_doc_unreadable`, `delta_ops_failed`, `delta_ops_all_skipped`, `delta_not_applied`, `structured_output_failed` |
+| `failure_reason` | string \| absent | On a failure record: why it refused — `retrieval_failed`, `no_answer`, `unexpected_error`, `empty_candidate`, `structured_doc_unreadable`, `delta_ops_failed`, `delta_ops_all_skipped`, `delta_not_applied`, `structured_output_failed`, `candidate_rejected` |
 | `error_message` | string \| absent | On a failure record: the exception, as the operation reports it |
 
 Each version entry captures the **content before the change** and when it happened. The current content is returned by the standard [Get a Mental Model](#get-a-mental-model) endpoint.

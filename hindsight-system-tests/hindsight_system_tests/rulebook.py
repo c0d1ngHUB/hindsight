@@ -53,6 +53,14 @@ class ChatRequest:
     def all_text(self) -> str:
         return "\n".join(_text_of(m.get("content")) for m in self.messages)
 
+    def has_result_of(self, tool: str) -> bool:
+        """Whether an earlier turn of this conversation called ``tool`` and got its result.
+
+        Hindsight replays a tool conversation as plain turns, a result as a user turn
+        opening "Result of `<tool>`:" (``providers/tools_via_schema.as_text_messages``).
+        """
+        return f"Result of `{tool}`:" in self.user_text
+
 
 def _text_of(content: Any) -> str:
     """The text of a message, whether it is a string or OpenAI content parts."""
@@ -89,6 +97,9 @@ class StubbedReply:
 
     error_status: int | None = None
     """When set, the stub answers with a provider error at this HTTP status instead."""
+
+    retry_after_seconds: int | None = None
+    """Sent as the error's ``Retry-After`` header: when a rate-limited provider says it resets."""
 
 
 @dataclass(frozen=True)
@@ -153,14 +164,17 @@ class RuleBuilder:
             )
         )
 
-    def fails_with_status(self, status: int) -> LLMStub:
+    def fails_with_status(self, status: int, *, retry_after_seconds: int | None = None) -> LLMStub:
         """Answer with a provider error at ``status`` — a 429 or a 5xx, say.
 
         For stories about how the server treats a provider that is down or
-        rate-limited, which no successful reply can stand in for.
+        rate-limited, which no successful reply can stand in for. ``retry_after_seconds``
+        is the provider's reported quota reset, which the worker defers the operation to.
         """
         return self._register(
-            lambda _request: StubbedReply(message={}, finish_reason="error", error_status=status)
+            lambda _request: StubbedReply(
+                message={}, finish_reason="error", error_status=status, retry_after_seconds=retry_after_seconds
+            )
         )
 
     def returns_text(self, text: str) -> LLMStub:
@@ -446,13 +460,28 @@ class LLMStub:
         self._install_builtins()
 
 
+@dataclass(frozen=True)
+class EmbeddingCall:
+    model: str
+    inputs: list[str]
+
+
 class EmbeddingStub:
     """Deterministic embeddings — see ``lexical.py`` for why word overlap suffices."""
 
-    def embed(self, text: str) -> list[float]:
+    #: Answer every call with this provider error instead — a 429 or a 5xx — for the
+    #: stories about what the server leaves behind when its embeddings backend is down.
+    fail_with_status: int | None = None
+
+    def __init__(self) -> None:
+        #: Every embeddings request, in arrival order: which model was asked for which
+        #: texts. Lets a story check which embedder a server sent a text to.
+        self.calls: list[EmbeddingCall] = []
+
+    def embed(self, text: str, dimension: int) -> list[float]:
         from .lexical import lexical_embedding
 
-        return lexical_embedding(text)
+        return lexical_embedding(text, dimension)
 
 
 class RerankStub:
@@ -472,9 +501,25 @@ class RerankStub:
     #: model was told besides the memory.
     states: list[str]
 
+    #: Pairs a dedup question ("Memory B is a repeat of Memory A") answers yes for, each
+    #: as (text in Memory A, text in Memory B). Every other pair is not a repeat.
+    repeats: set[tuple[str, str]]
+
+    #: The candidates of every ranking question, as the decision model read them.
+    ranked: list[str]
+
+    #: Answer every decision-model request with this provider error instead, for the
+    #: stories about a recall whose decision model fails. The /rerank endpoint ignores it.
+    fail_with_status: int | None = None
+
     def __init__(self) -> None:
         self.verdicts = {}
         self.states = []
+        self.repeats = set()
+        self.ranked = []
+
+    def repeat(self, memory_a: str, memory_b: str) -> float:
+        return 0.9 if any(a in memory_a and b in memory_b for a, b in self.repeats) else 0.1
 
     def verdict(self, state: str, memory: str) -> float:
         scripted = next((score for text, score in self.verdicts.items() if text in memory), None)
@@ -491,27 +536,20 @@ class TriageStub:
 
     Triage asks TypeSafe, per new fact, how it relates to the observations shown
     (``relation``), which one it restates (``match`` / ``covers_oN``) and which it makes
-    should be reworded (``touches_oN``); under a bank's own mission also whether the mission
-    would keep the fact as stated (``keep_as``); every judgment is a choice. A story names the verdict for a
-    fact by a phrase in its text; every other fact gets "changes" with nothing flagged
-    and no mission fit, which hands it to the LLM — what an unconfigured stub must do so
+    should be reworded (``touches_oN``); every judgment is a choice. A story names the verdict
+    for a fact by a phrase in its text; every other fact gets "changes" with nothing flagged,
+    which hands it to the LLM — what an unconfigured stub must do so
     no story is settled by accident.
     """
 
     def __init__(self) -> None:
         self.verdicts: dict[str, str] = {}
-        #: Phrases of facts the bank's mission wants, worded as it allows.
-        self.fits_mission: set[str] = set()
 
     def relation(self, fact_text: str) -> str:
         return next((v for phrase, v in self.verdicts.items() if phrase in fact_text), "changes")
 
-    def fits(self, fact_text: str) -> bool:
-        return any(phrase in fact_text for phrase in self.fits_mission)
-
     def reset(self) -> None:
         self.verdicts.clear()
-        self.fits_mission.clear()
 
 
 @dataclass(frozen=True)
@@ -564,9 +602,13 @@ class Stubs:
         from what a story set on it (cut level, verdicts) or it recorded, which has to
         go back to its default or it leaks into whatever runs next."""
         self.llm.reset()
+        self.embeddings.fail_with_status = None
+        self.embeddings.calls.clear()
         self.rerank.cut_level = RerankStub.cut_level
         self.rerank.verdicts = {}
         self.rerank.states = []
+        self.rerank.repeats = set()
+        self.rerank.fail_with_status = None
         self.triage.reset()
         self.rejected_requests.clear()
         self.webhooks.clear()

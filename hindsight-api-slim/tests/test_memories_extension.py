@@ -30,6 +30,7 @@ from unittest.mock import patch
 import pytest
 
 from hindsight_api.engine.chunk_ids import build_chunk_id
+from hindsight_api.engine.db import DatabaseBackend
 from hindsight_api.extensions import OperationValidationError
 from hindsight_api.engine.memories import create_memories, get_memories, set_memories
 from hindsight_api.engine.memories.base import (
@@ -685,6 +686,7 @@ class InMemoryMemories(MemoriesExtension):
         file_content_type="",
         file_original_name="",
         expect_content_hash=None,
+        keep_chunk_text=True,
     ):
         self.calls.append("put_document")
         if expect_content_hash is not None:
@@ -695,7 +697,7 @@ class InMemoryMemories(MemoriesExtension):
             "id": str(document_id),
             "content_hash": content_hash,
             "original_text": original_text,
-            "chunk_texts": list(chunk_texts),
+            "chunk_texts": list(chunk_texts) if keep_chunk_text else [""] * len(chunk_texts),
             "tags": list(tags or []),
             "metadata": dict(metadata or {}),
             "file_content_type": file_content_type,
@@ -855,8 +857,8 @@ class InMemoryMemories(MemoriesExtension):
 
     # -- transfer (#4969): the archive and document provenance an export/import carries ----------
 
-    async def dump_archived_memories(self, *, conn, fq_table, bank_id):
-        return [
+    async def iter_archived_memories(self, *, backend, fq_table, bank_id, page_size):
+        yield [
             {
                 "text": row.text,
                 "fact_type": row.fact_type,
@@ -1440,6 +1442,40 @@ def _stored(unit_id, text, fact_type, **kw):
     return StoredMemory(unit_id=unit_id, text=text, fact_type=fact_type, created_at=datetime.now(timezone.utc), **kw)
 
 
+class _CapsItsPages(InMemoryMemories):
+    """A store that serves at most 1,000 rows a page, whatever ``limit`` asks for, and records
+    every ``limit`` it was asked — the shape of a store with a page cap."""
+
+    def __init__(self, config=None):
+        super().__init__(config)
+        self.asked: list[int] = []
+
+    async def scan_memories(self, *, conn, fq_table, bank_id, limit=100, page_token="", **kwargs):
+        self.asked.append(limit)
+        return await super().scan_memories(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, limit=min(limit, 1000), page_token=page_token, **kwargs
+        )
+
+
+async def test_whole_set_reads_page_to_the_end_without_an_oversized_page():
+    """A default that needs every matching memory pages to the end: one call with a huge limit
+    stops at the store's page cap, and a store that sizes its admission by the limit reserves
+    memory for rows it will never return."""
+    store = _CapsItsPages()
+    for i in range(2500):
+        uid = str(uuid.UUID(int=i + 1))
+        store.rows[uid] = _stored(uid, f"fact {i}", "world")
+
+    scope = await store.bank_memories_of_type(conn=None, fq_table=None, bank_id="b", fact_type="world")
+    assert sorted(scope.unit_ids) == sorted(store.rows)
+    assert store.asked and max(store.asked) <= 1000
+
+    store.asked.clear()
+    requeued = await store.clear_observations_and_requeue(conn=None, fq_table=None, bank_id="b")
+    assert requeued == 0
+    assert len(store.asked) == 3 and max(store.asked) <= 1000
+
+
 async def test_store_document_bodies_carries_retain_params(restore_default_store):
     """A store that owns the whole retain has NO SQL `documents` row, so anything the write path
     does not put in the store record is lost outright.
@@ -1475,6 +1511,130 @@ async def test_store_document_bodies_carries_retain_params(restore_default_store
     carried = store.documents[doc_id]["metadata"].get("retain_params")
     assert carried is not None, "retain_params must reach the store record, not be dropped"
     assert _json.loads(carried) == params, carried
+
+
+async def test_store_document_bodies_keeps_no_text_for_a_bank_that_keeps_none(restore_default_store):
+    """A bank with `store_document_text` off keeps neither its body nor its chunk texts in the
+    store, as the SQL path keeps neither (#6249). The chunks still go over: the store needs their
+    text to record the hashes delta retain diffs against, and is told not to keep it."""
+    from hindsight_api.engine.retain.orchestrator import _store_document_bodies
+
+    store = InMemoryMemories({})
+    set_memories(store)
+    suffix = uuid.uuid4().hex[:8]
+    doc_id = f"doc-{suffix}"
+
+    class _Cfg:
+        store_document_text = False
+
+    await _store_document_bodies(
+        bank_id=f"seam-notext-{suffix}",
+        document_id=doc_id,
+        combined_content="Alice moved to Berlin.",
+        chunk_texts=["Alice moved to Berlin."],
+        merged_tags=None,
+        config=_Cfg(),
+    )
+    assert store.documents[doc_id]["original_text"] is None
+    assert store.documents[doc_id]["chunk_texts"] == [""]
+
+
+async def test_batched_body_flush_keeps_no_text_for_a_bank_that_keeps_none(restore_default_store):
+    """The end-of-retain flush writes several documents in one `put_documents` call, which builds
+    its own arguments rather than going through `_store_document_bodies`: it must honour
+    `store_document_text` the same way (#6249)."""
+    from hindsight_api.engine.retain.orchestrator import (
+        DocumentBodyAccumulator,
+        DocumentBodyMeta,
+        flush_document_bodies,
+    )
+
+    class _Batching(InMemoryMemories):
+        async def put_documents(self, *, bank_id, documents):
+            self.calls.append("put_documents")
+            await super().put_documents(bank_id=bank_id, documents=documents)
+
+    store = _Batching({})
+    set_memories(store)
+
+    class _Cfg:
+        store_document_text = False
+
+    def _acc(text: str) -> DocumentBodyAccumulator:
+        acc = DocumentBodyAccumulator(
+            meta=DocumentBodyMeta(
+                bank_id="bank-notext",
+                content_hash="h",
+                combined_content=text,
+                merged_tags=None,
+                config=_Cfg(),
+                retain_params=None,
+                expect_content_hash=None,
+            )
+        )
+        acc.slices[0] = [text]
+        return acc
+
+    await flush_document_bodies({"doc-a": _acc("Alice moved to Berlin."), "doc-b": _acc("Bob moved to Rome.")})
+
+    assert "put_documents" in store.calls, "two documents must go as one batch, the path under test"
+    for doc_id in ("doc-a", "doc-b"):
+        assert store.documents[doc_id]["original_text"] is None
+        assert store.documents[doc_id]["chunk_texts"] == [""]
+
+
+async def test_metadata_only_re_put_keeps_no_text_for_a_bank_that_keeps_none(monkeypatch, restore_default_store):
+    """An unchanged re-send re-puts the record to change its labels. It used to re-put the full
+    body whatever the bank said, so a bank that keeps no text got it back on every re-send
+    (#6249)."""
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from hindsight_api.engine.retain import orchestrator as orch
+    from hindsight_api.engine.retain.types import RetainContent
+
+    store = InMemoryMemories({})
+    set_memories(store)
+    await store.put_document(
+        bank_id="bank-notext",
+        document_id="doc-1",
+        content_hash="v1",
+        original_text=None,
+        chunk_texts=["Alice moved to Berlin."],
+        keep_chunk_text=False,
+    )
+
+    class _NoConnection:
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+    @asynccontextmanager
+    async def _no_connection(_pool):
+        yield _NoConnection()
+
+    async def _relabel(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(orch, "acquire_with_retry", _no_connection)
+    monkeypatch.setattr(orch.fact_storage, "update_memory_units_metadata_and_tags", _relabel)
+
+    result = await orch._delta_metadata_only(
+        pool=SimpleNamespace(ops=None),
+        bank_id="bank-notext",
+        contents_dicts=[{"content": "Alice moved to Berlin.", "document_id": "doc-1", "tags": ["team-b"]}],
+        contents=[RetainContent(content="Alice moved to Berlin.")],
+        document_id="doc-1",
+        document_tags=None,
+        log_buffer=[],
+        start_time=0.0,
+        outbox_callback=None,
+        config=SimpleNamespace(store_document_text=False),
+    )
+
+    assert result is not None
+    assert store.documents["doc-1"]["original_text"] is None
+    assert store.documents["doc-1"]["chunk_texts"] == [""]
 
 
 async def test_store_document_bodies_omits_absent_retain_params(restore_default_store):
@@ -1887,6 +2047,62 @@ async def test_ensuring_a_bank_ensures_its_storage(memory, request_context, rest
 
     assert "ensure_bank_storage" in store.calls
     assert "lifecycle-bank" in store.ensured
+
+
+class _ProbesTheRow(InMemoryMemories):
+    """Records, on each ensure, whether the bank row was already visible to other requests."""
+
+    def __init__(self, backend: DatabaseBackend):
+        super().__init__({})
+        self._backend = backend
+        self.row_was_there: list[bool] = []
+
+    async def ensure_bank_storage(self, bank_id: str) -> None:
+        from hindsight_api.engine.retain import bank_utils
+
+        self.row_was_there.append(await bank_utils.bank_exists(self._backend, bank_id))
+        await super().ensure_bank_storage(bank_id)
+
+
+async def test_storage_is_ensured_before_the_bank_row_is_visible(memory, request_context, restore_default_store):
+    """The row is what makes a bank readable to every other request, so the storage goes first.
+
+    A store that owns its storage faults a read against a bank whose storage is not there yet —
+    correctly, since it cannot tell that from storage that has gone missing. With the row written
+    first, every request arriving in the gap gets that fault on a bank that was only just asked
+    for, and the gap is not nominal: the create is a round trip to an external service. A client
+    that creates a bank and immediately reads it is the normal case, not a race to be tolerated.
+    """
+    store = _ProbesTheRow(await memory._get_backend())
+    set_memories(store)
+
+    await memory._ensure_bank_exists("storage-first-bank", request_context)
+
+    assert store.row_was_there == [False], "the bank row must not be visible before its storage exists"
+
+
+async def test_importing_a_bank_ensures_its_storage_before_the_row(memory, request_context, restore_default_store):
+    """Import writes the bank row itself, bypassing the create path, so it needs the same order."""
+    from hindsight_api.engine.db_utils import acquire_with_retry
+    from hindsight_api.engine.transfer import export_bank
+
+    bank_id = f"storage-first-import-{uuid.uuid4().hex[:8]}"
+    backend = await memory._get_backend()
+    # Exported and deleted under the default store, so only the restore runs against the probe.
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+    async with acquire_with_retry(backend) as conn:
+        archive = await export_bank(conn, bank_id)
+    await memory.delete_bank(bank_id, request_context=request_context)
+
+    store = _ProbesTheRow(backend)
+    set_memories(store)
+    try:
+        await memory.import_bank_async(archive, request_context)
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    # Later ensures of the now-existing bank see the row; only the first one, the import's, must not.
+    assert store.row_was_there[:1] == [False], "the restored bank row must not be visible before its storage"
 
 
 async def test_ensuring_an_existing_bank_still_ensures_its_storage(memory, request_context, restore_default_store):

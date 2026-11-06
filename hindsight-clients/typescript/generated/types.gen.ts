@@ -43,7 +43,7 @@ export type AsyncOperationSubmitResponse = {
 /**
  * AuditLogEntry
  *
- * A single audit log entry.
+ * A single audit log entry with its full request/response bodies.
  */
 export type AuditLogEntry = {
   /**
@@ -77,6 +77,12 @@ export type AuditLogEntry = {
    */
   duration_ms?: number | null;
   /**
+   * Metadata
+   */
+  metadata: {
+    [key: string]: unknown;
+  };
+  /**
    * Request
    */
   request: {
@@ -88,12 +94,6 @@ export type AuditLogEntry = {
   response: {
     [key: string]: unknown;
   } | null;
-  /**
-   * Metadata
-   */
-  metadata: {
-    [key: string]: unknown;
-  };
 };
 
 /**
@@ -120,8 +120,10 @@ export type AuditLogListResponse = {
   offset: number;
   /**
    * Items
+   *
+   * Entries without request/response bodies; fetch one entry by id for its bodies.
    */
-  items: Array<AuditLogEntry>;
+  items: Array<AuditLogSummary>;
 };
 
 /**
@@ -172,6 +174,50 @@ export type AuditLogStatsResponse = {
    * Buckets
    */
   buckets: Array<AuditLogStatsBucket>;
+};
+
+/**
+ * AuditLogSummary
+ *
+ * An audit log entry without its request/response bodies, as the list returns it.
+ */
+export type AuditLogSummary = {
+  /**
+   * Id
+   */
+  id: string;
+  /**
+   * Action
+   */
+  action: string;
+  /**
+   * Transport
+   */
+  transport: string;
+  /**
+   * Bank Id
+   */
+  bank_id: string | null;
+  /**
+   * Started At
+   */
+  started_at: string | null;
+  /**
+   * Ended At
+   */
+  ended_at: string | null;
+  /**
+   * Duration Ms
+   *
+   * Server-computed duration in milliseconds (started_at → ended_at). Null if not yet completed.
+   */
+  duration_ms?: number | null;
+  /**
+   * Metadata
+   */
+  metadata: {
+    [key: string]: unknown;
+  };
 };
 
 /**
@@ -505,6 +551,12 @@ export type BankStatsResponse = {
    * Total number of observations
    */
   total_observations?: number;
+  /**
+   * Paused Mental Models
+   *
+   * Number of mental models whose last refresh failed, so the automatic triggers (`refresh_after_consolidation`, `refresh_cron`, `full_refresh_cron`) skip them until an explicit refresh succeeds. Their content stops updating, so alert on this being above 0. Each model's `last_refresh_failed_at` says which ones, and its history says why.
+   */
+  paused_mental_models?: number;
 };
 
 /**
@@ -601,6 +653,12 @@ export type BankTemplateConfig = {
    */
   mental_model_refresh_use_decision_model?: boolean | null;
   /**
+   * Mental Model Delta Use Decision Model
+   *
+   * When the server has a decision model, a delta knowledge-page refresh asks it which new memories could change the page instead of running reflect
+   */
+  mental_model_delta_use_decision_model?: boolean | null;
+  /**
    * Disposition Skepticism
    *
    * Skepticism trait (1-5)
@@ -695,6 +753,18 @@ export type BankTemplateConfig = {
     [key: string]: unknown;
   }> | null;
   /**
+   * Default Observation Scopes
+   *
+   * observation_scopes applied at retain to items that send none ('combined' when unset). A list of tag lists may use globs, e.g. [['topic:*']] scopes each memory by its own topic tags.
+   */
+  default_observation_scopes?:
+    | "per_tag"
+    | "combined"
+    | "all_combinations"
+    | "shared"
+    | Array<Array<string>>
+    | null;
+  /**
    * Consolidation Strategies
    *
    * Per-scope consolidation settings: [{"scopes": [{"tags": ["company:*"]}], "observations_mission": "Record only generalized trends.", "max_observations_per_scope": 20}]. Each strategy lists the rules it claims scopes with — a rule's tags are fnmatch globs that must all be on the scope, and its "tags_match" decides whether the scope may carry others ("all", the default) or not ("exact"). The rules are alternatives: any one matching claims the scope. A strategy may set any of observations_mission, max_observations_per_scope, consolidation_source_facts_max_tokens and consolidation_source_facts_max_tokens_per_observation; each is optional. Exactly one strategy applies to a scope: the first in the list that claims it. Whatever that strategy leaves unset — and every scope no strategy claims — uses the bank-wide value; a later strategy never fills the gaps. Supersedes observation_scope_limits. Lets one bank be federated across user/team/company tag scopes, each consolidating under its own brief.
@@ -717,7 +787,7 @@ export type BankTemplateConfig = {
   /**
    * Reflect Default Options
    *
-   * Default reflect options for this bank (e.g. {"reflect_search_observations_max_tokens": 3000, "reflect_search_observations_include_entities": false}). Applied to every reflect in the bank -- API, MCP and mental-model refresh -- whenever the request (or the model's trigger) leaves the option unset.
+   * Default reflect options for this bank (e.g. {"reflect_search_observations_max_tokens": 3000, "reflect_search_observations_include_entities": false}). Applied to every reflect request in the bank (API and MCP) that leaves the option unset. Mental-model refreshes do not read it: they take these options from their own trigger, defaulted per bank by knowledge_page_default_trigger.
    */
   reflect_default_options?: {
     [key: string]: unknown;
@@ -801,6 +871,12 @@ export type BankTemplateConfig = {
    */
   store_document_text?: boolean | null;
   /**
+   * Default Timezone
+   *
+   * IANA zone (e.g. 'Europe/Rome') a retain timestamp, or a time the LLM extracts, is read in when it carries no UTC offset.
+   */
+  default_timezone?: string | null;
+  /**
    * Enable Auto Consolidation
    *
    * Automatically consolidate observations after retain
@@ -809,7 +885,7 @@ export type BankTemplateConfig = {
   /**
    * Consolidation Use Decision Model
    *
-   * When the server has a decision model, consolidation lets it settle restatements, new facets and chatter before the LLM call
+   * When the server has a decision model, consolidation lets it settle restatements and chatter before the LLM call
    */
   consolidation_use_decision_model?: boolean | null;
   /**
@@ -836,6 +912,18 @@ export type BankTemplateConfig = {
    * Default for recall prefer_observations when the request omits it
    */
   recall_prefer_observations?: boolean | null;
+  /**
+   * Recall Decision Model Prune
+   *
+   * Default for recall prune when the request omits it (decision-model reranker only)
+   */
+  recall_decision_model_prune?: boolean | null;
+  /**
+   * Recall Decision Model Dedup
+   *
+   * Default for recall dedup when the request omits it (decision-model reranker only)
+   */
+  recall_decision_model_dedup?: boolean | null;
   /**
    * Recall Max Tokens
    *
@@ -997,7 +1085,7 @@ export type BankTemplateMentalModel = {
   /**
    * Id
    *
-   * Unique ID for the mental model (alphanumeric lowercase with hyphens)
+   * Unique ID for the mental model (same rules as a bank id: at most 192 bytes of UTF-8, no '/' and no control characters)
    */
   id: string;
   /**
@@ -1491,7 +1579,7 @@ export type CreateBankAliasRequest = {
   /**
    * Alias
    *
-   * The extra bank id. Same rules as a bank id (non-empty, at most 192 bytes of UTF-8, no control characters, no leading underscore), and it must not already name a bank or another alias.
+   * The extra bank id. Same rules as a bank id (non-empty, at most 192 bytes of UTF-8, no '/', no control characters, no leading underscore), and it must not already name a bank or another alias.
    */
   alias: string;
   /**
@@ -1711,7 +1799,7 @@ export type CreateMentalModelRequest = {
   /**
    * Id
    *
-   * Optional custom ID for the mental model (alphanumeric lowercase with hyphens)
+   * Optional custom ID for the mental model (same rules as a bank id: at most 192 bytes of UTF-8, no '/' and no control characters)
    */
   id?: string | null;
   /**
@@ -2016,6 +2104,64 @@ export type DispositionTraits = {
 };
 
 /**
+ * DocumentEvent
+ *
+ * One change to a document, and its effect on the facts and observations built from it.
+ */
+export type DocumentEvent = {
+  /**
+   * Document Id
+   */
+  document_id: string;
+  kind: DocumentEventKind;
+  /**
+   * Created At
+   */
+  created_at?: string;
+  /**
+   * Operation Id
+   *
+   * The operation this event was recorded on (filled in when read).
+   */
+  operation_id?: string | null;
+  /**
+   * Fact Id
+   *
+   * The fact a fact_* event changed.
+   */
+  fact_id?: string | null;
+  /**
+   * Facts Added
+   */
+  facts_added?: number;
+  /**
+   * Facts Removed
+   */
+  facts_removed?: number;
+  observations_created?: ObservationIdSample;
+  observations_updated?: ObservationIdSample;
+  observations_removed?: ObservationIdSample;
+};
+
+/**
+ * DocumentEventKind
+ *
+ * What a change was. A named enum, not a Literal: inline enums are named after their field by
+ * the generated Rust client, and ``kind`` already names the knowledge-base node enum there.
+ */
+export type DocumentEventKind =
+  | "retain"
+  | "append"
+  | "reprocess"
+  | "retag"
+  | "fact_edited"
+  | "fact_invalidated"
+  | "fact_restored"
+  | "fact_deleted"
+  | "observations_cleared"
+  | "consolidation";
+
+/**
  * DocumentExportSubmitResponse
  *
  * Response for the async document-export endpoint (202).
@@ -2034,6 +2180,35 @@ export type DocumentExportSubmitResponse = {
    * Status
    */
   status?: string;
+};
+
+/**
+ * DocumentHistoryResponse
+ *
+ * A document's change history, newest first. ``total``, ``limit`` and ``offset`` count operations:
+ * one operation can carry several events for the same document (an oversized retain in slices).
+ */
+export type DocumentHistoryResponse = {
+  /**
+   * Document Id
+   */
+  document_id: string;
+  /**
+   * Total
+   */
+  total: number;
+  /**
+   * Limit
+   */
+  limit: number;
+  /**
+   * Offset
+   */
+  offset: number;
+  /**
+   * Items
+   */
+  items: Array<DocumentEvent>;
 };
 
 /**
@@ -3283,6 +3458,26 @@ export type LlmRequestListResponse = {
    * Items
    */
   items: Array<LlmRequestEntry>;
+  /**
+   * Retention Days
+   */
+  retention_days?: number | null;
+};
+
+/**
+ * LLMRequestSeriesSums
+ *
+ * Calls and tokens (total + reasoning) of one model or operation within a time bucket.
+ */
+export type LlmRequestSeriesSums = {
+  /**
+   * Calls
+   */
+  calls: number;
+  /**
+   * Tokens
+   */
+  tokens: number;
 };
 
 /**
@@ -3306,6 +3501,12 @@ export type LlmRequestStatsBucket = {
    */
   total: number;
   tokens: LlmRequestTokenSums;
+  /**
+   * Series
+   */
+  series?: {
+    [key: string]: LlmRequestSeriesSums;
+  } | null;
 };
 
 /**
@@ -3334,6 +3535,10 @@ export type LlmRequestStatsResponse = {
    * Buckets
    */
   buckets: Array<LlmRequestStatsBucket>;
+  /**
+   * Retention Days
+   */
+  retention_days?: number | null;
 };
 
 /**
@@ -3983,7 +4188,7 @@ export type MemoryItem = {
   /**
    * ObservationScopes
    *
-   * How to scope observations during consolidation. 'per_tag' runs one consolidation pass per individual tag, creating separate observations for each tag. 'combined' (default) runs a single pass with all tags together. 'shared' runs a single pass over one global, untagged scope, so memories consolidate together regardless of their tags — useful for deduplicating across volatile per-call provenance tags (e.g. per-session ids) while keeping those tags on the source facts. A list of tag lists runs one pass per inner list, giving full control over which combinations to use.
+   * How to scope observations during consolidation. 'per_tag' runs one consolidation pass per individual tag, creating separate observations for each tag. 'combined' (default) runs a single pass with all tags together. 'shared' runs a single pass over one global, untagged scope, so memories consolidate together regardless of their tags — useful for deduplicating across volatile per-call provenance tags (e.g. per-session ids) while keeping those tags on the source facts. A list of tag lists runs one pass per inner list, giving full control over which combinations to use. An entry containing '*' is a glob matched against the memory's own tags — e.g. [['topic:*', 'user:*']] scopes by the memory's topic and user tags (including tags added by entity labels at retain) and ignores the rest; a scope whose globs match nothing is skipped. When omitted, the bank's default_observation_scopes applies ('combined' unless configured).
    */
   observation_scopes?:
     | "per_tag"
@@ -4633,9 +4838,15 @@ export type MentalModelResponse = {
    */
   created_at?: string | null;
   /**
+   * Is Knowledge Page
+   *
+   * True when this model holds a knowledge page's content rather than being a standalone mental model. Set by the list and get endpoints.
+   */
+  is_knowledge_page?: boolean | null;
+  /**
    * Reflect Response
    *
-   * Full reflect API response payload including based_on facts and observations
+   * Full reflect API response payload including based_on facts and observations. On a single-model read, each world/experience/observation entry in based_on also carries `attachments`: the retained images and files that memory was extracted from.
    */
   reflect_response?: {
     [key: string]: unknown;
@@ -5045,7 +5256,7 @@ export type MinScores = {
   /**
    * Reranker
    *
-   * Post-query: minimum normalized reranker score (0-1). Applied to every returned result. Rejected with HTTP 400 when the reranker scores by rank position (TypeSafe), since a floor would only keep a fixed share of the results.
+   * Post-query: minimum normalized reranker score (0-1). Applied to every returned result. Rejected with HTTP 400 when the reranker scores by rank position (a decision model, or TypeSafe), since a floor would only keep a fixed share of the results.
    */
   reranker?: number | null;
   /**
@@ -5054,6 +5265,22 @@ export type MinScores = {
    * Post-query: minimum final ranking score. Applied to every returned result.
    */
   final?: number | null;
+};
+
+/**
+ * ObservationIdSample
+ *
+ * How many observations an event touched, and (up to ``MAX_IDS``) which.
+ */
+export type ObservationIdSample = {
+  /**
+   * Count
+   */
+  count?: number;
+  /**
+   * Ids
+   */
+  ids?: Array<string>;
 };
 
 /**
@@ -5562,6 +5789,10 @@ export type RecallRequest = {
    * When recalling raw facts ('world'/'experience') together with 'observation', drop any raw fact that an observation in the results was consolidated from, so the observation supersedes it and you don't get duplicate content. The freed slots are backfilled with the next results, keeping the result count at the requested budget. When omitted, uses the bank/global recall_prefer_observations config (false unless configured). No effect unless 'observation' and at least one raw type are both requested.
    */
   prefer_observations?: boolean | null;
+  /**
+   * What the decision-model reranker does beyond ordering: drop results that do not help (`prune`) or that repeat a better-ranked one (`dedup`). Each field left unset uses the bank/global config. No effect unless a decision model is set up for recall.
+   */
+  rerank?: RerankOptions | null;
   budget?: Budget;
   /**
    * Max Tokens
@@ -5971,6 +6202,12 @@ export type ReflectRequest = {
    */
   reflect_search_observations_include_entities?: boolean | null;
   /**
+   * Reflect Search Mental Models Max Tokens
+   *
+   * Token budget for the mental models search_mental_models returns in full, packed in rank order. The best-ranked one is always in full; the others that do not fit come back as a snippet the model can read with read_mental_models. Raise it for banks with long pages or answers spread across pages; lower it to cut the reflect context. None means use the shipped default (16000).
+   */
+  reflect_search_mental_models_max_tokens?: number | null;
+  /**
    * Query
    */
   query: string;
@@ -6180,6 +6417,7 @@ export type RefreshMentalModelOperationDetails = {
     | "refresh_failed_empty_candidate"
     | "refresh_failed_delta_not_applied"
     | "refresh_failed_structured_output"
+    | "refresh_failed_candidate_rejected"
     | "refresh_failed_error";
   /**
    * Failure Reason
@@ -6193,6 +6431,7 @@ export type RefreshMentalModelOperationDetails = {
     | "delta_ops_all_skipped"
     | "delta_not_applied"
     | "structured_output_failed"
+    | "candidate_rejected"
     | "retrieval_failed"
     | "no_answer"
     | "unexpected_error"
@@ -6231,6 +6470,27 @@ export type ReprocessDocumentResponse = {
    * Items Count
    */
   items_count: number;
+};
+
+/**
+ * RerankOptions
+ *
+ * What the decision-model reranker does beyond ordering. Each field left unset (null) uses the
+ * bank/global config; neither has any effect unless a decision model is set up for recall.
+ */
+export type RerankOptions = {
+  /**
+   * Prune
+   *
+   * Drop the results the decision model judges no help to the query, instead of only ranking them last. Costs no extra request. When omitted, uses the bank/global recall_decision_model_prune config (false unless configured).
+   */
+  prune?: boolean | null;
+  /**
+   * Dedup
+   *
+   * Drop a result that repeats a better-ranked one, so the same fact comes back once. Costs one more decision-model request after the ranking one. When omitted, uses the bank/global recall_decision_model_dedup config (false unless configured).
+   */
+  dedup?: boolean | null;
 };
 
 /**
@@ -6758,7 +7018,7 @@ export type UpdateDocumentRequest = {
   /**
    * UpdateDocumentObservationScopes
    *
-   * New observation scoping for the document's memories, with the same values retain accepts (send 'combined' to return to the default). Use it to move memories retained under one scoping to another — e.g. per-session documents to 'shared' — without re-extracting them. Memories whose resolved scopes change lose their observations and are re-consolidated; the rest keep theirs. Also becomes the scoping a later reprocess of the document uses.
+   * New observation scoping for the document's memories, with the same values retain accepts (send 'combined' to scope by each memory's full tag set). Use it to move memories retained under one scoping to another — e.g. per-session documents to 'shared' — without re-extracting them. Memories whose resolved scopes change lose their observations and are re-consolidated; the rest keep theirs. Also becomes the scoping a later reprocess of the document uses.
    */
   observation_scopes?:
     | "per_tag"
@@ -6816,6 +7076,12 @@ export type UpdateMemoryRequest = {
    * New occurred-range end (ISO 8601). '' clears it; omit to leave unchanged.
    */
   occurred_end?: string | null;
+  /**
+   * Mentioned At
+   *
+   * New mention time — when the fact was said or written (ISO 8601). '' clears it; omit to leave unchanged.
+   */
+  mentioned_at?: string | null;
   /**
    * Fact Type
    *
@@ -7289,6 +7555,8 @@ export type GetGraphData = {
     limit?: number;
     /**
      * Q
+     *
+     * Case-insensitive substring filter on memory text and context. Not indexed: it scans the bank, so it slows as the bank grows. Meant for browsing and inspection, not for high-volume or latency-sensitive workloads — use recall for that.
      */
     q?: string | null;
     /**
@@ -7354,6 +7622,8 @@ export type ListMemoriesData = {
     type?: string | null;
     /**
      * Q
+     *
+     * Case-insensitive substring filter on memory text and context. Not indexed: it scans the bank, so it slows as the bank grows. Meant for browsing and inspection, not for high-volume or latency-sensitive workloads — use recall for that.
      */
     q?: string | null;
     /**
@@ -8169,6 +8439,12 @@ export type ListMentalModelsData = {
      * Offset
      */
     offset?: number;
+    /**
+     * Exclude Knowledge Pages
+     *
+     * Leave out the mental models that hold knowledge page content (list standalone models only).
+     */
+    exclude_knowledge_pages?: boolean;
   };
   url: "/v1/default/banks/{bank_id}/mental-models";
 };
@@ -9250,6 +9526,60 @@ export type ListDocumentChunksResponses = {
 
 export type ListDocumentChunksResponse =
   ListDocumentChunksResponses[keyof ListDocumentChunksResponses];
+
+export type GetDocumentHistoryData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Document Id
+     */
+    document_id: string;
+  };
+  query?: {
+    /**
+     * Limit
+     *
+     * Maximum number of operations to read
+     */
+    limit?: number;
+    /**
+     * Offset
+     *
+     * Offset for pagination, in operations
+     */
+    offset?: number;
+  };
+  url: "/v1/default/banks/{bank_id}/documents/{document_id}/history";
+};
+
+export type GetDocumentHistoryErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type GetDocumentHistoryError = GetDocumentHistoryErrors[keyof GetDocumentHistoryErrors];
+
+export type GetDocumentHistoryResponses = {
+  /**
+   * Successful Response
+   */
+  200: DocumentHistoryResponse;
+};
+
+export type GetDocumentHistoryResponse =
+  GetDocumentHistoryResponses[keyof GetDocumentHistoryResponses];
 
 export type ReprocessDocumentData = {
   body?: never;
@@ -11481,6 +11811,50 @@ export type AuditLogStatsResponses = {
 
 export type AuditLogStatsResponse2 = AuditLogStatsResponses[keyof AuditLogStatsResponses];
 
+export type GetAuditLogData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Log Id
+     */
+    log_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/audit-logs/{log_id}";
+};
+
+export type GetAuditLogErrors = {
+  /**
+   * Bank or audit log entry not found
+   */
+  404: unknown;
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type GetAuditLogError = GetAuditLogErrors[keyof GetAuditLogErrors];
+
+export type GetAuditLogResponses = {
+  /**
+   * Successful Response
+   */
+  200: AuditLogEntry;
+};
+
+export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];
+
 export type ListLlmRequestsData = {
   body?: never;
   headers?: {
@@ -11514,6 +11888,12 @@ export type ListLlmRequestsData = {
      * Filter by call scope
      */
     scope?: string | null;
+    /**
+     * Call Type
+     *
+     * Filter by kind of model call, told apart by scope: embedding (embedding_*), rerank, decision (decision_*), or llm (every other scope)
+     */
+    call_type?: "llm" | "embedding" | "rerank" | "decision" | null;
     /**
      * Provider
      *
@@ -11616,11 +11996,23 @@ export type LlmRequestStatsData = {
      */
     operation?: string | null;
     /**
+     * Call Type
+     *
+     * Filter by kind of model call: llm, embedding, rerank or decision
+     */
+    call_type?: "llm" | "embedding" | "rerank" | "decision" | null;
+    /**
      * Period
      *
-     * Time period: 1d, 7d, or 30d
+     * Time period: 1d (by hour), 7d, or 30d (by day)
      */
     period?: string;
+    /**
+     * Split By
+     *
+     * Also split each bucket by model or by operation (returned in `series`)
+     */
+    split_by?: "model" | "operation" | null;
   };
   url: "/v1/default/banks/{bank_id}/llm-requests/stats";
 };

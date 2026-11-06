@@ -64,6 +64,22 @@ def process(data: UserData) -> str:
 - Next.js App Router for control plane
 - Tailwind CSS with shadcn/ui components
 
+### Control plane on phones (390px wide)
+`globals.css` already covers the page never scrolling sideways, hover-only controls
+showing on touch screens, and form fields not zooming on iOS. The checks below are
+the part a shared rule can't cover:
+- Page sub-tabs use `components/ui/underline-tabs.tsx`, not a hand-rolled button row.
+- Any row of filters, toggles or buttons wraps (`flex-wrap`) or scrolls inside itself
+  (`max-w-full overflow-x-auto` with `shrink-0 whitespace-nowrap` children).
+- No fixed widths above ~340px without a phone fallback (`w-full sm:w-[420px]`,
+  `w-[min(420px,calc(100vw-1rem))]`). Side-by-side panes stack below `md`.
+- Every table goes through `components/ui/table.tsx`: it scrolls inside its own frame
+  and keeps a 40rem floor so columns don't get squashed on a phone.
+- Form sections laid out in a grid need `min-w-0` (the shared `Section` in
+  `form-layout.tsx` has it); side-by-side inputs stack below `sm`.
+- Full-height layouts use `h-dvh`/`100dvh`, not `h-screen`/`100vh` (iOS hides the
+  bottom under the URL bar otherwise).
+
 ### Code Comments
 - **Always comment non-trivial technical decisions** with the reasoning behind the choice. If someone would ask "why is it done this way?", there should be a comment.
 - **Keep comments up to date with history** — when changing an approach, update the comment to explain what was tried before and why it was changed. Comments serve as a tracker of previous implementations that likely had problems.
@@ -113,6 +129,11 @@ results = await asyncio.gather(*tasks, return_exceptions=True)
 - **Never use PostgreSQL advisory locks** (`pg_advisory_lock`, `pg_try_advisory_lock`, `pg_advisory_xact_lock`, `pg_advisory_unlock`, …) in migrations, engine code, or anything else. Hindsight runs against connection poolers and managed/PG-compatible services where advisory locks are unreliable or unsupported: session-level locks silently leak or vanish when a pooler hands the session to another client, and callers can block forever on a lock the server never grants. Reject any new occurrence, including ones that look "safe" because they are transaction-scoped.
 - The pre-existing usage in `hindsight_api/migrations.py` is grandfathered, not a precedent — it is tracked for removal. Don't copy it.
 - Design the concurrency out instead of locking around it: give each process its own object to write (e.g. per-schema DDL rather than a shared `public.` object), make the operation idempotent, or use a real row/table constraint (`INSERT ... ON CONFLICT`, `SELECT ... FOR UPDATE` in a fixed order). See #2690 for a migration that reached for `pg_advisory_xact_lock` and had to be reverted.
+
+### Text in SQL: SQL_ASCII databases are supported
+- Some users run Postgres with a `SQL_ASCII` database. There, string functions count **bytes**, not characters. `LEFT`, `RIGHT`, `SUBSTRING`/`substr`, `lpad`/`rpad` and `overlay` can cut a multibyte character (CJK, emoji, accents) in half, and the query fails with `invalid byte sequence for encoding "UTF8"` (#5986). `length()`/`char_length()` silently return byte counts.
+- **Never cut or measure user text in SQL.** Select the column and slice it in Python, where `str[:n]` is by character. `convert_from(convert_to(...))` does not help: on `SQL_ASCII` it still cuts by byte.
+- Exception: `LEFT(query, 200)` on `pg_stat_activity` in `worker/poller.py` is debug-only logging inside a `try/except`.
 
 ### Concurrency: asyncio vs threading primitives
 
@@ -437,6 +458,14 @@ Grep the diff for `advisory` (`git diff main...HEAD | grep -in advisory`). Any n
 `pg_advisory_unlock` call is a **must fix** — see Database Locking above. Point the
 author at the alternatives (per-process objects, idempotent DDL, row-level
 constraints) rather than just asking them to drop the lock.
+
+### 11h. Check SQL does not cut or measure text
+
+Grep the diff for SQL string functions on user text
+(`git diff main...HEAD | grep -inE "\b(left|right|substring|substr|lpad|rpad|overlay|char_length|length)\s*\("`).
+Any new one applied to user content (page bodies, memory text, names, queries) is a
+**must fix** — see "Text in SQL" above. Ask for the full column to be selected and
+cut in Python instead.
 
 ### 11e. Check for BaseHTTPMiddleware
 

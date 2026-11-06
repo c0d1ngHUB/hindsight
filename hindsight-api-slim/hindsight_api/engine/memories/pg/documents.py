@@ -23,6 +23,7 @@ from datetime import datetime
 from typing import Any
 
 from ...db_utils import acquire_with_retry
+from ...document_history import note_observations_removed
 from ...search.tags import TagGroup, TagsMatch, build_tag_groups_where_clause, build_tags_where_clause
 from ...time_filter import DOCUMENT_TIME_FIELDS, build_time_clause
 from ..base import (
@@ -362,13 +363,18 @@ async def current_document_tags(
 async def documents_tags(
     *, conn, fq_table: Callable[[str], str], bank_id: str, document_ids: list[str]
 ) -> dict[str, list[str]]:
-    """document id -> its `documents.tags`, for the ids that have a row in this bank."""
-    rows = await conn.fetch(
-        f"SELECT id, tags FROM {fq_table('documents')} WHERE id = ANY($1) AND bank_id = $2",
-        document_ids,
-        bank_id,
-    )
-    return {row["id"]: list(row["tags"] or []) for row in rows}
+    """document id -> its `documents.tags`, for the ids that have a row in this bank.
+
+    Read in groups of 1,000: Oracle expands ``= ANY`` into an IN list, which caps at 1,000."""
+    out: dict[str, list[str]] = {}
+    for start in range(0, len(document_ids), 1000):
+        rows = await conn.fetch(
+            f"SELECT id, tags FROM {fq_table('documents')} WHERE id = ANY($1) AND bank_id = $2",
+            document_ids[start : start + 1000],
+            bank_id,
+        )
+        out.update({row["id"]: list(row["tags"] or []) for row in rows})
+    return out
 
 
 async def update_document_tags(
@@ -557,6 +563,9 @@ async def retag_document_memories(
             )
         if affected_obs:
             obs_ids = [obs["id"] for obs in affected_obs]
+            note_observations_removed(
+                {str(obs["id"]): [str(src) for src in obs["source_memory_ids"] or []] for obs in affected_obs}, unit_ids
+            )
 
             seen: set[str] = set()
             other_source_uuids: list[uuid.UUID] = []

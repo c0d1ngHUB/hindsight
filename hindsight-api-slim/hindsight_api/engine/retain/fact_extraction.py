@@ -11,22 +11,29 @@ import logging
 import re
 from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from types import SimpleNamespace
+from datetime import datetime, timedelta, tzinfo
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
-from ..llm_interface import PromptCachePrefix, ProviderContentPolicyError, ProviderRateLimitResetError
+from ..llm_interface import (
+    PromptCachePrefix,
+    ProviderAuthError,
+    ProviderContentPolicyError,
+    ProviderRateLimitResetError,
+)
 from ..llm_wrapper import (
     AnyLLMProvider,
     OutputTooLongError,
     parse_llm_json,
+    reask_messages,
     sanitize_llm_output,
     sanitize_value,
 )
 from ..operation_metadata import RetainExtractionErrors
-from ..response_models import TokenUsage
+from ..remote_retry import status_code_of
+from ..response_models import BATCH_TERMINAL_FAILURE_STATUSES, BatchRequest, TokenUsage
+from ..stored_dates import is_placeholder_date
 from ..structured_output import provider_json_schema, strict_json_schema
 from . import attachment_content
 
@@ -311,8 +318,8 @@ class FactExtractionResponse(BaseModel):
 # this small still overflows the model's output cap, the cause is degenerate or
 # looping model output rather than genuinely dense input, and halving it just
 # recurses toward a single character. A few-hundred-character floor bounds that
-# runaway (an all-sizes-overflow 3000-char chunk drops in ~17 extraction calls
-# instead of ~5000) while staying well under any chunk that legitimately holds
+# runaway (an all-sizes-overflow 3000-char chunk fails the retain after ~17 extraction
+# calls instead of ~5000) while staying well under any chunk that legitimately holds
 # enough facts to exceed the cap.
 _MIN_SPLIT_CHUNK_CHARS = 500
 
@@ -1305,6 +1312,8 @@ For EVENTS (fact_kind="event") - MUST SET BOTH occurred_start AND occurred_end:
   Do NOT collapse a coarse date to the first day of the period, and do NOT resolve it to the
   Event Date — even when the period is the current year. A year-only date is not a precise
   date; recording it as one makes the memory claim a day it never stated.
+- OPEN-ENDED events (still ongoing, "since forever", no stated end): set only the bound the
+  text gives. NEVER write a placeholder year such as 0001 or 9999 for an unknown bound.
 
 For CONVERSATIONS (fact_kind="conversation"):
 - General info, preferences, ongoing states → NO occurred dates
@@ -1442,7 +1451,16 @@ def _build_labels_prompt_section(labels_cfg: EntityLabelsConfig | list | None, f
         lines.append("")
 
     if has_classification_attrs:
-        lines.append("Only assign labels when clearly applicable. Leave null/empty if the fact does not match.")
+        lines.append(
+            "Fill a label whenever the content gives a value for it, even when the same words are also "
+            "in the fact text or in 'entities'. Leave it null/empty only when the content gives none."
+        )
+        if any(attr.type in ("text", "multi-text") for attr in labels_cfg.attributes):
+            lines.append(
+                'Example: for a group that collects names, the text "we run PostgreSQL, which everyone calls '
+                'Postgres or PG" gives ["PostgreSQL", "Postgres", "PG"] for that group, while entities can still '
+                'list "PostgreSQL".'
+            )
         lines.append("")
 
     # Add structured entity types (map groups)
@@ -2002,10 +2020,22 @@ def _shape_repair_message(observed_keys: Collection[str], expected_keys: Sequenc
     )
 
 
+_ENVELOPE_CORRECTION = (
+    'Your reply was not a JSON object with a top-level "facts" array. Reply again with exactly '
+    '{"facts": [...]} following the schema, with no wrapper object around it. '
+    'If the text holds no facts, reply {"facts": []}.'
+)
+
+
 def _coerce_fact_response(response: Any) -> dict[str, Any] | None:
-    """Accept the schema wrapper, or a recoverable top-level facts array."""
+    """Accept the schema wrapper, or a recoverable top-level facts array.
+
+    A dict without a top-level ``facts`` list is a broken envelope, not an empty
+    extraction: reading it as ``[]`` would commit the document with 0 facts and
+    report success (#5582). Only an explicit ``{"facts": []}`` means "nothing here".
+    """
     if isinstance(response, dict):
-        return response
+        return response if isinstance(response.get("facts"), list) else None
     if isinstance(response, list) and all(isinstance(item, dict) for item in response):
         return {"facts": response}
     return None
@@ -2102,6 +2132,7 @@ async def _extract_facts_from_chunk(
     # using the wrong key names (#5280). None on the first attempt, so the happy
     # path pays nothing.
     repair_hint: str | None = None
+    refused_reply: Any = None
     expected_fact_keys = _expected_fact_keys(response_schema)
     for attempt in range(outer_attempts):
         try:
@@ -2119,9 +2150,9 @@ async def _extract_facts_from_chunk(
                 {"role": "user", "content": user_content},
             ]
             if repair_hint is not None:
-                # A separate turn rather than an edit to user_content, which may be a
+                # Separate turns rather than an edit to user_content, which may be a
                 # multi-part attachment payload.
-                messages.append({"role": "user", "content": repair_hint})
+                messages = reask_messages(messages, refused_reply, repair_hint)
 
             call_kwargs: dict[str, Any] = dict(
                 messages=messages,
@@ -2154,17 +2185,22 @@ async def _extract_facts_from_chunk(
             if coerced_response_json is None:
                 if attempt < outer_attempts - 1:
                     logger.warning(
-                        f"LLM returned non-dict JSON on attempt {attempt + 1}/{outer_attempts}: {type(extraction_response_json).__name__}. Retrying..."
+                        f"LLM reply had no top-level 'facts' list on attempt {attempt + 1}/{outer_attempts}: "
+                        f"{str(extraction_response_json)[:200]}. Retrying..."
                     )
+                    # Without this the retry resends the identical prompt to a model
+                    # that just ignored the envelope, and it tends to do so again.
+                    repair_hint = _ENVELOPE_CORRECTION
+                    refused_reply = extraction_response_json
                     continue
                 else:
-                    # A non-dict response is malformed (the schema is {"facts": [...]}).
-                    # Raise instead of returning [] so the failure propagates to the
-                    # worker's retry machinery and ultimately fails loudly — never
-                    # silently commit the document with 0 facts. See issue #1833.
+                    # The schema is {"facts": [...]}. Raise instead of returning [] so
+                    # the failure propagates to the worker's retry machinery and fails
+                    # loudly — never silently commit the document with 0 facts (#1833).
                     raise RuntimeError(
-                        f"Fact extraction failed: LLM returned non-dict JSON after {outer_attempts} attempts "
-                        f"({type(extraction_response_json).__name__}). Raw: {str(extraction_response_json)[:500]}"
+                        f"Fact extraction failed: LLM reply had no top-level 'facts' list after {outer_attempts} "
+                        f"attempts ({type(extraction_response_json).__name__}). "
+                        f"Raw: {str(extraction_response_json)[:500]}"
                     )
             extraction_response_json = coerced_response_json
 
@@ -2172,7 +2208,7 @@ async def _extract_facts_from_chunk(
 
             if not raw_facts:
                 logger.debug(
-                    f"LLM response missing 'facts' field or returned empty list. "
+                    f"LLM returned an empty facts list. "
                     f"Response: {extraction_response_json}. "
                     f"Input: "
                     f"date: {event_date.isoformat() if event_date else 'unset'}, "
@@ -2194,9 +2230,10 @@ async def _extract_facts_from_chunk(
                         return value
                     return None
 
-                # NEW FORMAT: what, when, who, why (all required)
+                # NEW FORMAT: what, when, where, who, why (all required)
                 what = get_value("what")
                 when = get_value("when")
+                where = get_value("where")
                 who = get_value("who")
                 why = get_value("why")
 
@@ -2239,7 +2276,7 @@ async def _extract_facts_from_chunk(
                 if fact_kind not in ["conversation", "event", "other"]:
                     fact_kind = "conversation"
 
-                # Build combined fact text from the 4 dimensions: what | when | who | why
+                # Build combined fact text from the 5 dimensions: what | when | where | who | why
                 # In verbatim mode, leave combined_text empty — _collapse_to_verbatim backfills it
                 # A kwargs BAG for `Fact(**fact_data)` below: its inferred value type is the union of
                 # everything put in it, so the unpack is checked against that union for every field.
@@ -2252,6 +2289,9 @@ async def _extract_facts_from_chunk(
 
                     if when:
                         combined_parts.append(f"When: {when}")
+
+                    if where:
+                        combined_parts.append(f"Where: {where}")
 
                     if who:
                         combined_parts.append(f"Involving: {who}")
@@ -2398,6 +2438,7 @@ async def _extract_facts_from_chunk(
                 # whose output shape is stable re-sends the same keys every attempt and
                 # the loop cannot converge — four identical discards, then a 500 (#5280).
                 repair_hint = _shape_repair_message(drifted_keys, expected_fact_keys)
+                refused_reply = extraction_response_json
                 if repair_hint is not None:
                     logger.warning(f"Re-asking with the required fact keys; model used: {sorted(drifted_keys)}")
                 continue
@@ -2567,11 +2608,14 @@ async def _extract_facts_with_auto_split(
 
         split_chunks = _split_chunk_for_output_retry(chunk)
         if split_chunks is None:
-            logger.warning(
-                f"Cannot make progress splitting chunk {chunk_index + 1}/{total_chunks} "
-                f"({len(chunk)} chars); dropping this sub-chunk."
+            # Raise rather than return []: an empty result commits the document with
+            # no facts and reports success, losing the content silently (#6129, same
+            # rule as #1833). The floor still stops the recursion (#3172).
+            raise RuntimeError(
+                f"Fact extraction failed: the LLM reply for chunk {chunk_index + 1}/{total_chunks} "
+                f"({len(chunk)} chars) exceeded the output token limit and the chunk is too small "
+                f"to split further. The model may be producing a runaway reply."
             )
-            return [], TokenUsage()
 
         first_half, second_half = split_chunks
 
@@ -2644,7 +2688,8 @@ async def extract_facts_from_text(
     to avoid hitting output token limits. Processes ALL chunks in PARALLEL for speed.
 
     If a chunk produces output that exceeds token limits (OutputTooLongError), it is
-    automatically split in half and retried recursively until successful.
+    automatically split in half and retried recursively. A piece too small to split
+    that still overflows fails the retain rather than being dropped (#6129).
 
     Args:
         text: Input text (conversation, article, etc.)
@@ -2776,6 +2821,17 @@ async def extract_facts_from_text(
                 f"{len(failed_chunks)} failed chunks ({len(chunks)} total) were refused; retrying cannot "
                 f"succeed. First failures: {failed_summary}"
             ) from policy_errors[0]
+
+        # A credential rejection (HTTP 401/403) is just as deterministic: every
+        # replay sends the same key (issue #5644). One is enough — the retain
+        # cannot succeed while the key is rejected.
+        auth_errors = [err for _, err in failed_chunks if status_code_of(err) in (401, 403)]
+        if auth_errors:
+            raise ProviderAuthError(
+                f"Fact extraction rejected by provider authentication: {len(auth_errors)} of "
+                f"{len(failed_chunks)} failed chunks ({len(chunks)} total) got HTTP 401/403; retrying with "
+                f"the same credentials cannot succeed. First failures: {failed_summary}"
+            ) from auth_errors[0]
 
         # Fail the entire retain — partial extraction is not acceptable.
         # All successfully extracted facts are discarded because the transaction
@@ -2983,9 +3039,7 @@ async def extract_facts_from_contents_batch_api(
                 extraction_prompt.response_schema,
             )
 
-            batch_requests.append(
-                {"custom_id": custom_id, "method": "POST", "url": "/v1/chat/completions", "body": request_body}
-            )
+            batch_requests.append(BatchRequest(custom_id=custom_id, body=request_body))
 
     if not batch_requests and not batch_id:  # No requests and not resuming
         return ExtractionResult([], [], TokenUsage())
@@ -2994,8 +3048,8 @@ async def extract_facts_from_contents_batch_api(
     if not batch_id:
         logger.info(f"Submitting batch with {len(batch_requests)} chunk requests")
 
-        batch_metadata = await batch_impl.submit_batch(batch_requests)
-        batch_id = batch_metadata["batch_id"]
+        submission = await batch_impl.submit_batch(batch_requests)
+        batch_id = submission.batch_id
 
         logger.info(f"Batch submitted: {batch_id}, polling every {config.retain_batch_poll_interval_seconds}s")
 
@@ -3037,20 +3091,19 @@ async def extract_facts_from_contents_batch_api(
     start_time = time.perf_counter()
     while True:
         status_info = await batch_impl.get_batch_status(batch_id)
-        status = status_info["status"]
+        status = status_info.status
 
         elapsed = time.perf_counter() - start_time
         logger.info(
             f"Batch {batch_id}: status={status}, "
-            f"completed={status_info['request_counts']['completed']}/{status_info['request_counts']['total']}, "
+            f"completed={status_info.request_counts.completed}/{status_info.request_counts.total}, "
             f"elapsed={elapsed:.0f}s"
         )
 
         if status == "completed":
             break
-        elif status in ("failed", "expired", "cancelled"):
-            error_msg = status_info.get("errors", "Unknown error")
-            raise RuntimeError(f"Batch {batch_id} failed with status {status}: {error_msg}")
+        elif status in BATCH_TERMINAL_FAILURE_STATUSES:
+            raise RuntimeError(f"Batch {batch_id} failed with status {status}: {status_info.error or 'Unknown error'}")
 
         # Wait before polling again
         await asyncio.sleep(config.retain_batch_poll_interval_seconds)
@@ -3064,7 +3117,7 @@ async def extract_facts_from_contents_batch_api(
     batch_results = sanitize_value(await batch_impl.retrieve_batch_results(batch_id))
 
     # Map results by custom_id
-    results_by_id = {result["custom_id"]: result for result in batch_results}
+    results_by_id = {result.custom_id: result for result in batch_results}
 
     # Step 5: Parse results into facts (same as sync mode)
     all_facts_from_llm = []
@@ -3090,8 +3143,8 @@ async def extract_facts_from_contents_batch_api(
             continue
 
         # Check for errors
-        if result.get("error"):
-            message = f"{custom_id}: {result['error']}"
+        if result.error:
+            message = f"{custom_id}: {result.error}"
             logger.error(f"Error in {message}")
             extraction_errors.add(message)
             chunks_metadata.append(
@@ -3102,11 +3155,8 @@ async def extract_facts_from_contents_batch_api(
             continue
 
         # Extract response
-        response_body = result.get("response", {}).get("body", {})
-        choices = response_body.get("choices", [])
-
-        if not choices:
-            message = f"{custom_id}: no choices in response"
+        if result.content is None:
+            message = f"{custom_id}: no content in response"
             logger.warning(message)
             extraction_errors.add(message)
             chunks_metadata.append(
@@ -3116,15 +3166,11 @@ async def extract_facts_from_contents_batch_api(
             )
             continue
 
-        # Parse JSON content
-        message = choices[0].get("message", {})
-        content_str = message.get("content", "{}")
-
         try:
             # #2701: use the lenient parser (strips markdown fences, scrubs
             # embedded control chars) so recoverable batch responses — e.g.
             # transient Gemini quirks — aren't dropped along with all their facts.
-            extraction_response_json = parse_llm_json(content_str)
+            extraction_response_json = parse_llm_json(result.content)
         except json.JSONDecodeError as e:
             message = f"{custom_id}: failed to parse JSON: {e}"
             logger.error(message)
@@ -3139,7 +3185,7 @@ async def extract_facts_from_contents_batch_api(
         response_type_name = type(extraction_response_json).__name__
         extraction_response_json = _coerce_fact_response(extraction_response_json)
         if extraction_response_json is None:
-            message = f"{custom_id}: LLM returned non-dict JSON ({response_type_name})"
+            message = f"{custom_id}: LLM reply had no top-level 'facts' list ({response_type_name})"
             logger.error(message)
             extraction_errors.add(message)
             chunks_metadata.append(
@@ -3188,6 +3234,7 @@ async def extract_facts_from_contents_batch_api(
                 continue
 
             when = get_value("when")
+            where = get_value("where")
             who = get_value("who")
             why = get_value("why")
 
@@ -3207,6 +3254,8 @@ async def extract_facts_from_contents_batch_api(
             combined_parts = [what]
             if when:
                 combined_parts.append(f"When: {when}")
+            if where:
+                combined_parts.append(f"Where: {where}")
             if who:
                 combined_parts.append(f"Involving: {who}")
             if why:
@@ -3344,17 +3393,7 @@ async def extract_facts_from_contents_batch_api(
             )
         )
 
-        # Track token usage
-        usage_data = response_body.get("usage", {})
-        if usage_data:
-            # Same OpenAI usage block a live call returns, so it is read the same
-            # way: cached prompt tokens and reasoning tokens included.
-            # Imported here: that module loads the openai SDK, which a process
-            # must not pay for at startup unless it actually reads batch results.
-            from ..providers.openai_compatible_llm import visible_token_usage
-
-            usage_obj = json.loads(json.dumps(usage_data), object_hook=lambda d: SimpleNamespace(**d))
-            total_usage = total_usage + visible_token_usage(SimpleNamespace(usage=usage_obj))
+        total_usage = total_usage + result.usage
 
     # Step 6: Convert to ExtractedFact objects with proper chunk mapping
     # Group facts by chunk
@@ -3372,6 +3411,7 @@ async def extract_facts_from_contents_batch_api(
 
     for chunk_meta, chunk_facts in facts_by_chunk:
         content = contents[chunk_meta.content_index]
+        content_tz = _content_timezone(content, config)
         extraction_group_start_idx = global_fact_idx
 
         for fact_from_llm in chunk_facts:
@@ -3379,8 +3419,12 @@ async def extract_facts_from_contents_batch_api(
                 fact_text=fact_from_llm.fact,
                 fact_type=fact_from_llm.fact_type,
                 entities=list(fact_from_llm.entities or []),
-                occurred_start=_parse_datetime(fact_from_llm.occurred_start) if fact_from_llm.occurred_start else None,
-                occurred_end=_parse_datetime(fact_from_llm.occurred_end) if fact_from_llm.occurred_end else None,
+                occurred_start=_parse_datetime(fact_from_llm.occurred_start, content_tz)
+                if fact_from_llm.occurred_start
+                else None,
+                occurred_end=_parse_datetime(fact_from_llm.occurred_end, content_tz)
+                if fact_from_llm.occurred_end
+                else None,
                 causal_relations=_convert_causal_relations(
                     fact_from_llm.causal_relations or [], extraction_group_start_idx, len(chunk_facts)
                 ),
@@ -3402,6 +3446,7 @@ async def extract_facts_from_contents_batch_api(
 
     # Step 8: Auto-tag facts from label groups with tag=True
     _inject_label_tags(extracted_facts, config)
+    _apply_default_observation_scopes(extracted_facts, config)
 
     await _write_batch_extraction_errors(pool, operation_id, schema, extraction_errors)
 
@@ -3565,6 +3610,7 @@ async def extract_facts_from_contents(
     for content_index, (content, (facts_from_llm, chunks_from_llm, content_usage)) in enumerate(valid_results):
         total_usage = total_usage + content_usage
         chunk_start_idx = global_chunk_idx
+        content_tz = _content_timezone(content, config)
 
         # Convert chunk tuples to ChunkMetadata objects
         for chunk_index_in_content, (chunk_text, chunk_fact_count) in enumerate(chunks_from_llm):
@@ -3592,10 +3638,12 @@ async def extract_facts_from_contents(
                     fact_type=fact_from_llm.fact_type,
                     entities=list(fact_from_llm.entities or []),
                     # occurred_start/end: from LLM only, leave None if not provided
-                    occurred_start=_parse_datetime(fact_from_llm.occurred_start)
+                    occurred_start=_parse_datetime(fact_from_llm.occurred_start, content_tz)
                     if fact_from_llm.occurred_start
                     else None,
-                    occurred_end=_parse_datetime(fact_from_llm.occurred_end) if fact_from_llm.occurred_end else None,
+                    occurred_end=_parse_datetime(fact_from_llm.occurred_end, content_tz)
+                    if fact_from_llm.occurred_end
+                    else None,
                     causal_relations=_convert_causal_relations(
                         fact_from_llm.causal_relations or [], extraction_group_start_idx, len(chunk_facts)
                     ),
@@ -3623,6 +3671,7 @@ async def extract_facts_from_contents(
 
     # Step 6: Auto-tag facts from label groups with tag=True
     _inject_label_tags(extracted_facts, config)
+    _apply_default_observation_scopes(extracted_facts, config)
 
     return ExtractionResult(extracted_facts, chunks_metadata, total_usage)
 
@@ -3662,14 +3711,37 @@ def _collapse_to_verbatim(facts: list[ExtractedFactType], chunks: list[ChunkMeta
     return result
 
 
-def _parse_datetime(date_str: str):
-    """Parse ISO datetime string."""
+def _parse_datetime(date_str: str, default_tz: tzinfo) -> datetime | None:
+    """Parse an ISO datetime from the LLM; None when unparseable or a placeholder.
+
+    A model sometimes writes an open-ended range as year 1 or 9999 ("since forever", "still
+    ongoing"); that is an unknown bound, not a date (see ``stored_dates``).
+
+    One with no UTC offset is read in ``default_tz``: the LLM copies clock times from the
+    content as written, so they are local to the content's Event Date, not UTC (issue #6208).
+    """
     from dateutil import parser as date_parser
 
     try:
-        return date_parser.isoparse(date_str)
+        parsed = date_parser.isoparse(date_str)
     except Exception:
         return None
+    if is_placeholder_date(parsed):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=default_tz)
+
+
+def _content_timezone(content: RetainContent, config: Any) -> tzinfo:
+    """The zone the LLM's offset-less times for ``content`` are read in.
+
+    The content's own Event Date offset when it has one, else the bank's default zone.
+    """
+    from .orchestrator import bank_timezone
+
+    event_date = content.event_date
+    if isinstance(event_date, datetime) and event_date.tzinfo is not None:
+        return event_date.tzinfo
+    return bank_timezone(config)
 
 
 def _convert_causal_relations(
@@ -3722,6 +3794,20 @@ def _add_temporal_offsets(facts: list[ExtractedFactType], contents: list[RetainC
             fact.occurred_end = parse_datetime_flexible(fact.occurred_end) + offset
         if fact.mentioned_at:
             fact.mentioned_at = parse_datetime_flexible(fact.mentioned_at) + offset
+
+
+def _apply_default_observation_scopes(facts: list[ExtractedFactType], config) -> None:
+    """Give facts whose retain declared no ``observation_scopes`` the bank's default.
+
+    Stamped on the stored memory rather than resolved at consolidation time, so changing
+    the default later never re-scopes memories already retained under the old one.
+    """
+    default = config.default_observation_scopes
+    if not default:
+        return
+    for fact in facts:
+        if fact.observation_scopes is None:
+            fact.observation_scopes = default
 
 
 def _inject_label_tags(facts: list[ExtractedFactType], config) -> None:

@@ -17,15 +17,11 @@ import pytest
 import pytest_asyncio
 
 import hindsight_api.engine.memory_engine as memory_engine_module
-from hindsight_api.api import page_markdown
+from hindsight_api.engine import page_markdown
 from hindsight_api.engine.db import DatabaseConnection
-from hindsight_api.engine.memory_engine import (
-    KnowledgeTagFilter,
-    MemoryEngine,
-    _may_need_refresh,
-    fq_table,
-)
+from hindsight_api.engine.memory_engine import KnowledgeTagFilter, MemoryEngine, _may_need_refresh
 from hindsight_api.engine.retain import embedding_utils
+from hindsight_api.engine.schema import fq_table
 from hindsight_api.extensions import (
     BankReadContext,
     BankReadOperation,
@@ -1034,6 +1030,9 @@ class TestMoveRenameDelete:
         assert hit.status_code == 200, hit.text
         assert any(r["id"] == ids.orders for r in hit.json()["results"])
 
+    # Reads the mental_models.embedding column, which a store-owned bank leaves empty: its page
+    # vectors live in the store's index.
+    @pytest.mark.memory_backend_incompatible
     async def test_rename_page_reembeds_backing_model(
         self, api_client, kb_bank, memory: MemoryEngine, request_context, monkeypatch
     ):
@@ -1417,8 +1416,8 @@ class TestMoveRenameDelete:
 class TestListReportsTheContentItDelivers:
     """A list that carries content is a bulk read of that content.
 
-    A knowledge page is a mental_models row and is not excluded from
-    list_mental_models, so a list that returns content hands back every
+    A knowledge page is a mental_models row and list_mental_models includes
+    it by default, so a list that returns content hands back every
     page in the bank. Reporting the single-page read while leaving that
     unreported would watch the narrow door and leave the wide one open — a
     caller could enumerate a bank's synthesized knowledge by asking for it in
@@ -1526,6 +1525,58 @@ class TestListReportsTheContentItDelivers:
 
         assert any(m["id"] == legacy["id"] for m in page.items), "the page is still listed"
         assert legacy["id"] not in validator.model_reads
+
+
+class TestListStandaloneMentalModels:
+    """The Mental Models tab lists standalone models only (#5665).
+
+    A knowledge page keeps its content in a mental_models row; with
+    exclude_knowledge_pages those rows stay out of the list and its total.
+    """
+
+    async def test_page_backing_models_are_left_out(self, api_client, memory, kb_bank, request_context):
+        bank_id, ids = kb_bank
+        standalone = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Coding preferences",
+            source_query="How does the user like code written?",
+            content="Functional style.",
+            request_context=request_context,
+        )
+
+        everything = await api_client.get(f"/v1/default/banks/{_enc(bank_id)}/mental-models")
+        flags = {m["id"]: m["is_knowledge_page"] for m in everything.json()["items"]}
+        assert flags[ids.orders_mm] is True
+        assert flags[standalone["id"]] is False
+
+        resp = await api_client.get(
+            f"/v1/default/banks/{_enc(bank_id)}/mental-models", params={"exclude_knowledge_pages": "true"}
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert [m["id"] for m in body["items"]] == [standalone["id"]]
+        assert body["total"] == 1
+
+    async def test_get_says_whether_a_model_backs_a_page(self, api_client, kb_bank):
+        bank_id, ids = kb_bank
+        resp = await api_client.get(f"/v1/default/banks/{_enc(bank_id)}/mental-models/{ids.orders_mm}")
+        assert resp.status_code == 200
+        assert resp.json()["is_knowledge_page"] is True
+
+    async def test_template_export_leaves_pages_out(self, api_client, memory, kb_bank, request_context):
+        # A template carries no pages; their models would come back as standalone ones.
+        bank_id, _ = kb_bank
+        standalone = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Coding preferences",
+            source_query="How does the user like code written?",
+            content="Functional style.",
+            request_context=request_context,
+        )
+
+        resp = await api_client.get(f"/v1/default/banks/{_enc(bank_id)}/export")
+        assert resp.status_code == 200
+        assert [m["id"] for m in resp.json()["mental_models"]] == [standalone["id"]]
 
 
 class TestExportReportsOnceNotPerPage:
@@ -1805,7 +1856,7 @@ class TestAuthorizationWriteDenied:
         assert "Orders" not in resp.text
         assert _write_ops(validator) == []
 
-    @pytest.mark.parametrize("body", [{"tags": []}, {"max_tokens": 0}, {"name": ""}])
+    @pytest.mark.parametrize("body", [{"tags": []}, {"source_query": ""}, {"name": ""}])
     async def test_empty_but_supplied_values_still_authorize(self, api_client, kb_bank, memory, monkeypatch, body):
         """The near misses of the guard above: supplied-but-empty is a real change.
 
@@ -2040,3 +2091,12 @@ class TestTagFilter:
             f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/search", params={"q": "orders billing net-30"}
         )
         assert {r["id"] for r in resp.json()["results"]} == {ids.billing}
+
+
+def test_knowledge_snippet_cuts_by_character_not_byte():
+    # #5986: SQL LEFT() on a SQL_ASCII database counts bytes and splits a CJK character,
+    # failing the whole search. The snippet is now cut in Python, by character.
+    body = "a" * 279 + "作业作业"
+    snippet = memory_engine_module._knowledge_snippet(body)
+    assert snippet == "a" * 279 + "作"
+    assert len(snippet) == memory_engine_module.KNOWLEDGE_SNIPPET_CHARS

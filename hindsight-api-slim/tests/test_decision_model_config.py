@@ -16,6 +16,7 @@ from hindsight_api.engine.decision_model import (
     DecisionResponse,
     DecisionUsage,
 )
+from hindsight_api.engine.decision_rerank_interface import MAX_QUESTIONS
 from hindsight_api.engine.remote_retry import RetryPolicy
 from hindsight_api.engine.token_encoding import count_tokens
 from tests.aiohttp_stub import stub_server
@@ -51,6 +52,7 @@ def test_global_setup_reaches_every_operation(monkeypatch):
             timeout=60.0,
             max_concurrent=24,
             max_request_tokens=26_000,
+            tokenizer="jev",
         )
 
 
@@ -220,7 +222,9 @@ def _client(provider: str, base_url: str, model: str) -> DecisionModel:
 async def test_typesafe_speaks_system_one():
     upstream = _Upstream(reply=_SYSTEM_ONE_ANSWERS)
     async with stub_server(upstream.handle) as base_url:
-        answer = await _client("typesafe", base_url + "/", "jev-preview").ask({"fact": "x"}, _QUESTIONS)
+        answer = await _client("typesafe", base_url + "/", "jev-preview").ask(
+            {"fact": "x"}, _QUESTIONS, scope="decision_test"
+        )
 
     assert answer == _EXPECTED
     assert upstream.paths == ["/v1/systemone"]
@@ -233,7 +237,9 @@ async def test_cloudflare_posts_system_one_to_the_workers_ai_model_and_unwraps_t
     upstream = _Upstream(reply={"result": _SYSTEM_ONE_ANSWERS, "success": True, "errors": [], "messages": []})
     async with stub_server(upstream.handle) as base_url:
         account_url = f"{base_url}/client/v4/accounts/acct/ai/run"
-        answer = await _client("cloudflare", account_url, "clef").ask("Checkout is down.", _QUESTIONS)
+        answer = await _client("cloudflare", account_url, "clef").ask(
+            "Checkout is down.", _QUESTIONS, scope="decision_test"
+        )
 
     assert answer == _EXPECTED
     assert upstream.paths == ["/client/v4/accounts/acct/ai/run/@cf/cloudflare/clef"]
@@ -270,7 +276,7 @@ async def test_openai_translates_to_the_decisions_api_and_back():
         }
     )
     async with stub_server(upstream.handle) as base_url:
-        answer = await _client("openai", base_url, "gpt-6-luna").ask({"fact": "x"}, _QUESTIONS)
+        answer = await _client("openai", base_url, "gpt-6-luna").ask({"fact": "x"}, _QUESTIONS, scope="decision_test")
 
     assert answer == _EXPECTED
     assert upstream.paths == ["/v1/decisions"]
@@ -308,12 +314,53 @@ async def test_openai_refusal_raises():
     upstream = _Upstream(reply={"answers": [{"type": "refusal", "name": "urgent"}]})
     async with stub_server(upstream.handle) as base_url:
         with pytest.raises(DecisionRefusedError, match="urgent"):
-            await _client("openai", base_url, "gpt-6-luna").ask("x", {"urgent": _QUESTIONS["urgent"]})
+            await _client("openai", base_url, "gpt-6-luna").ask(
+                "x", {"urgent": _QUESTIONS["urgent"]}, scope="decision_test"
+            )
+
+
+def test_typesafe_counts_in_jevs_own_vocabulary_by_default(monkeypatch):
+    """The window is Jev's, so its ceiling is counted the way Jev counts."""
+    assert _config(monkeypatch, _GLOBAL).decision_model_config("recall").tokenizer == "jev"
+
+
+def test_the_tokenizer_follows_the_model_not_the_provider(monkeypatch):
+    """A System One endpoint serving another model names that model's vocabulary."""
+    config = _config(monkeypatch, {**_GLOBAL, "HINDSIGHT_API_DECISION_MODEL_TOKENIZER": "qwen3.5"})
+    assert config.decision_model_config("recall").tokenizer == "qwen3.5"
+
+
+def test_an_unknown_tokenizer_fails_at_setup(monkeypatch):
+    with pytest.raises(ValueError, match="HINDSIGHT_API_DECISION_MODEL_TOKENIZER"):
+        _config(monkeypatch, {**_GLOBAL, "HINDSIGHT_API_DECISION_MODEL_TOKENIZER": "nope"}).decision_model_config(
+            "recall"
+        )
+
+
+def test_a_provider_with_no_known_vocabulary_counts_with_the_configured_one(monkeypatch):
+    config = _config(
+        monkeypatch, {"HINDSIGHT_API_DECISION_MODEL_PROVIDER": "openai", "HINDSIGHT_API_DECISION_MODEL_API_KEY": "k"}
+    )
+    assert config.decision_model_config("recall").tokenizer is None
+
+
+async def test_requests_are_split_in_the_models_own_vocabulary():
+    """'jev' counts mixed-script text well past o200k_base: a pool that fits one request by
+    o200k_base needs more than one by Jev's count, and each still fits by Jev's count."""
+    questions = _nouls(40, "東京 café naïve 🎉 " * 20)
+    by_o200k = DecisionModel("typesafe", "k", "jev-latest", "http://x", 5.0, 2, 26_000)
+    by_jev = DecisionModel("typesafe", "k", "jev-latest", "http://x", 5.0, 2, 26_000, tokenizer="jev")
+    assert len(by_o200k._split("q", questions)) == 1
+    parts = by_jev._split("q", questions)
+    assert len(parts) > 1
+    for part in parts:
+        body = {"model": "jev-latest", "state": "q", "questions": {k: q.system_one() for k, q in part.items()}}
+        assert count_tokens(json.dumps(body), "jev") <= 26_000
 
 
 def test_the_default_request_ceiling_fits_a_32k_window(monkeypatch):
-    """The endpoint counted 14% more than we do on the same body."""
-    assert _config(monkeypatch, {}).decision_model_max_request_tokens * 1.14 < 32_768
+    """The endpoint counted 14% more than o200k_base on the same body."""
+    assert _config(monkeypatch, _GLOBAL).decision_model_config("recall").max_request_tokens * 1.14 < 32_768
 
 
 @pytest.mark.parametrize(
@@ -334,10 +381,13 @@ def test_a_setting_no_request_can_work_with_fails_at_startup(monkeypatch, settin
 @dataclass
 class _Answering:
     """A System One upstream answering every question it is sent. A request whose
-    questions include ``down`` fails with 503; the first ``limited`` requests get 429."""
+    questions include ``down`` fails with 503; the first ``limited`` requests get 429.
+    A ``window`` counts tokens the way Jev does on mixed-script text — twice ours (#5715) —
+    and refuses a body over it as System One does."""
 
     down: str | None = None
     limited: int = 0
+    window: int | None = None
     bodies: list[Any] = field(default_factory=list)
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
@@ -346,6 +396,8 @@ class _Answering:
         if self.limited:
             self.limited -= 1
             return web.json_response({"detail": "slow down"}, status=429)
+        if self.window is not None and 2 * count_tokens(json.dumps(body)) > self.window:
+            return web.json_response({"detail": {"error_type": "max_tokens_exceeded"}}, status=400)
         if self.down in body["questions"]:
             return web.json_response({"detail": "down"}, status=503)
         return web.json_response({"answers": {key: {"noul": 0.5} for key in body["questions"]}})
@@ -376,7 +428,7 @@ async def test_every_request_fits_the_ceiling_counting_the_whole_body():
     questions = _nouls(60, "memory about the storage layer")
     async with stub_server(upstream.handle) as base_url:
         answers = await _splitting_client(base_url, max_request_tokens=1_500).ask_all(
-            "what did we decide about the storage layer " * 40, questions
+            "what did we decide about the storage layer " * 40, questions, scope="decision_test"
         )
     assert len(upstream.bodies) > 1
     assert all(count_tokens(json.dumps(body)) <= 1_500 for body in upstream.bodies)
@@ -386,24 +438,46 @@ async def test_every_request_fits_the_ceiling_counting_the_whole_body():
 async def test_a_pool_over_the_question_cap_is_split():
     upstream = _Answering()
     async with stub_server(upstream.handle) as base_url:
-        await _splitting_client(base_url).ask_all("q", _nouls(DecisionModel.MAX_QUESTIONS + 5, "x"))
-    assert sorted(len(body["questions"]) for body in upstream.bodies) == [5, DecisionModel.MAX_QUESTIONS]
+        await _splitting_client(base_url).ask_all("q", _nouls(MAX_QUESTIONS + 5, "x"), scope="decision_test")
+    assert sorted(len(body["questions"]) for body in upstream.bodies) == [5, MAX_QUESTIONS]
 
 
 async def test_a_rate_limited_request_is_retried():
     """One replica returns 429 as soon as a few recalls overlap; the request must not be lost."""
     upstream = _Answering(limited=1)
     async with stub_server(upstream.handle) as base_url:
-        answers = await _splitting_client(base_url).ask_all("q", _nouls(1, "x"))
+        answers = await _splitting_client(base_url).ask_all("q", _nouls(1, "x"), scope="decision_test")
     assert len(upstream.bodies) == 2
     assert answers["m0"].noul == 0.5
 
 
-async def test_a_request_that_keeps_failing_loses_only_its_own_answers():
+async def test_a_request_that_keeps_failing_raises_instead_of_dropping_its_answers():
+    """An unanswered question is not a "no": a caller handed a partial answer set reads
+    the missing ones as the worst answer, with no sign anything failed."""
     upstream = _Answering(down="m0")
-    questions = _nouls(4, "word " * 400)
     async with stub_server(upstream.handle) as base_url:
-        answers = await _splitting_client(base_url, max_request_tokens=1_000).ask_all("q", questions)
-    failed = next(body["questions"] for body in upstream.bodies if "m0" in body["questions"])
-    assert len(failed) < len(questions), "the pool must have been split for this to mean anything"
-    assert set(answers) == set(questions) - set(failed)
+        with pytest.raises(Exception, match="503"):
+            await _splitting_client(base_url, max_request_tokens=1_000).ask_all(
+                "q", _nouls(4, "word " * 400), scope="decision_test"
+            )
+
+
+async def test_a_request_over_the_models_own_window_is_asked_in_halves():
+    """Sized to fit by our count, over the window by Jev's (#5715): halved until it fits,
+    every question still answered once."""
+    upstream = _Answering(window=4_000)
+    questions = _nouls(8, "word " * 200)
+    async with stub_server(upstream.handle) as base_url:
+        answers = await _splitting_client(base_url, max_request_tokens=26_000).ask(
+            "q", questions, scope="decision_test"
+        )
+    assert set(answers.answers) == set(questions)
+    answered = [body for body in upstream.bodies if 2 * count_tokens(json.dumps(body)) <= 4_000]
+    assert sorted(key for body in answered for key in body["questions"]) == sorted(questions)
+
+
+async def test_one_question_over_the_models_window_raises():
+    upstream = _Answering(window=1_000)
+    async with stub_server(upstream.handle) as base_url:
+        with pytest.raises(Exception, match="max_tokens_exceeded"):
+            await _splitting_client(base_url).ask_all("q", _nouls(1, "word " * 1_000), scope="decision_test")

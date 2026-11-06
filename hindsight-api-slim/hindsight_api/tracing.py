@@ -21,7 +21,7 @@ from opentelemetry.trace import Status, StatusCode
 
 if TYPE_CHECKING:
     from opentelemetry.context import Context
-    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace import Span, SpanProcessor, TracerProvider
 
     from .config import HindsightConfig, StaticConfigProxy
 
@@ -147,6 +147,33 @@ PROVIDER_NAME_MAPPING = {
 }
 
 
+def bank_id_span_processor() -> "SpanProcessor":
+    """A span processor that stamps ``hindsight.bank_id`` on every span started inside a
+    bank-scoped operation.
+
+    Per-bank routing (e.g. an OTel collector sending each bank to its own backend project)
+    keys on this attribute, and the model-call spans that carry token counts start deep
+    inside the operation, so tagging only the operation span left the cost unattributed.
+    Built here so the SDK still loads only when tracing is on.
+    """
+    from opentelemetry.sdk.trace import SpanProcessor
+
+    # Imported here: llm_trace imports this module.
+    from .engine.llm_trace import current_trace_context
+    from .schema_context import get_current_bank_id
+
+    class BankIdSpanProcessor(SpanProcessor):
+        def on_start(self, span: "Span", parent_context: "Context | None" = None) -> None:
+            if span.attributes and "hindsight.bank_id" in span.attributes:
+                return
+            ctx = current_trace_context()
+            bank_id = (ctx.bank_id if ctx else None) or get_current_bank_id()
+            if bank_id:
+                span.set_attribute("hindsight.bank_id", bank_id)
+
+    return BankIdSpanProcessor()
+
+
 def initialize_tracing(
     service_name: str,
     endpoint: str,
@@ -200,8 +227,9 @@ def initialize_tracing(
         headers=headers_dict,
     )
 
-    # Create tracer provider with batch processor
+    # Create tracer provider: stamp the bank on each span, then batch-export
     provider = TracerProvider(resource=resource)
+    provider.add_span_processor(bank_id_span_processor())
     provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
 
     # Set global tracer provider
@@ -419,7 +447,8 @@ class LLMSpanRecorder:
         model: str,
         scope: str,
         messages: list[dict[str, str]],
-        response_content: Optional[str],
+        # Text for LLM calls; structured for rerank scores and decision answers.
+        response_content: str | dict[str, Any] | None,
         input_tokens: int,
         output_tokens: int,
         duration: float,
@@ -428,6 +457,7 @@ class LLMSpanRecorder:
         tool_calls: Optional[list[dict[str, Any]]] = None,
         cached_tokens: int = 0,
         thoughts_tokens: Optional[int] = None,
+        served_by: Optional[str] = None,
         **_extra: Any,
     ) -> None:
         """
@@ -442,7 +472,7 @@ class LLMSpanRecorder:
             model: Model name
             scope: Scope identifier (memory, reflect, consolidation, etc.)
             messages: Input messages (chat history)
-            response_content: Response text from LLM
+            response_content: Response text from LLM, or a structured result (rerank scores, decision answers)
             input_tokens: Input token count
             output_tokens: Output token count
             duration: Call duration in seconds
@@ -452,14 +482,21 @@ class LLMSpanRecorder:
             cached_tokens: Cached/cache-read prompt tokens, when reported by the provider.
             thoughts_tokens: Reasoning tokens, when reported by the provider. Not part of
                 ``output_tokens``, which is visible-only.
+            served_by: The upstream a gateway routed the call to. Taken from ``error``
+                when the failing call's exception carries it.
             _extra: Tolerated forward-compatible kwargs from other recorders.
         """
+        served_by = served_by or getattr(error, "served_by", None)
         try:
             # Map provider name to GenAI semantic convention
             genai_provider = PROVIDER_NAME_MAPPING.get(provider.lower(), provider.lower())
 
-            # Determine operation name based on scope/context
-            operation_name = "chat"  # Default for GenAI semantic conventions
+            # Read off the scope, like the call's kind in the request history: embedding
+            # and rerank calls are recorded here too, and must not pass as chat. Imported
+            # here because llm_trace imports this module.
+            from .engine.llm_trace import genai_operation_name
+
+            operation_name = genai_operation_name(scope)
 
             # Create span name: "hindsight.{scope}" for consistency with parent spans
             # Model info is available in span attributes (gen_ai.request.model)
@@ -497,6 +534,10 @@ class LLMSpanRecorder:
                 # Add custom attributes for Hindsight context
                 span.set_attribute("hindsight.scope", scope)
                 span.set_attribute("hindsight.provider.internal", provider)
+                # The upstream a gateway (OpenRouter) routed this call to: what lets a
+                # failure rate be attributed to one endpoint rather than the model (#5612).
+                if served_by:
+                    span.set_attribute("hindsight.provider.served_by", served_by)
 
                 # Add tool call information if present
                 if tool_calls:
@@ -581,7 +622,7 @@ class LLMSpanRecorder:
 
     def _format_output(
         self,
-        content: Optional[str],
+        content: str | dict[str, Any] | None,
         finish_reason: Optional[str],
     ) -> str:
         """Format output message into GenAI semantic convention format."""
@@ -589,9 +630,11 @@ class LLMSpanRecorder:
             if content is None:
                 return "[]"
 
-            # Truncate if needed
-            if isinstance(content, str):
-                content = _truncate_content(content)
+            # Truncate if needed. Structured output (rerank scores, decision answers) is
+            # serialized first so it is cut like text instead of exported whole.
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False, default=str)
+            content = _truncate_content(content)
 
             return json.dumps(
                 [
